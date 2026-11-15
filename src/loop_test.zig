@@ -19,6 +19,8 @@ const Tag = packed struct(u64) {
     const Op = enum(u8) { recv, send, timer, _ };
 };
 
+const Wait = Loop(Tag).Wait;
+
 const App = struct {
     seen: [16]Tag = undefined,
     results: [16]i32 = undefined,
@@ -47,7 +49,7 @@ test "a tag of op, slot, and generation survives the ring unchanged" {
     _ = try loop.nop(tag);
 
     var app: App = .{};
-    try loop.tick(&app, App.onCompletion, .once);
+    _ = try loop.tick(&app, App.onCompletion, .once);
 
     try testing.expectEqual(@as(usize, 1), app.count);
     try testing.expectEqual(@as(u16, 0xBEEF), app.seen[0].slot);
@@ -64,7 +66,7 @@ test "a pointer tag works the same way" {
     defer loop.deinit();
 
     _ = try loop.nop(&node);
-    try loop.tick({}, struct {
+    _ = try loop.tick({}, struct {
         fn on(_: void, _: *Loop(*Node), cqe: Loop(*Node).Cqe) !void {
             cqe.tag.completed = true;
         }
@@ -82,7 +84,7 @@ test "one tick dispatches a batch, then submits nothing left behind" {
         _ = try loop.nop(.{ .op = .timer, .slot = @intCast(i), .gen = 1 });
     }
     var app: App = .{};
-    try loop.tick(&app, App.onCompletion, .once);
+    _ = try loop.tick(&app, App.onCompletion, .once);
 
     try testing.expectEqual(@as(usize, 4), app.count);
     try testing.expectEqual(@as(u64, 4), loop.stats.cqes);
@@ -107,7 +109,7 @@ test "a handler that submits mid-batch does not re-enter the copy path" {
     for (0..4) |i| {
         _ = try loop.nop(.{ .op = .timer, .slot = @intCast(i), .gen = 0 });
     }
-    try loop.tick({}, Arm.on, .once);
+    _ = try loop.tick({}, Arm.on, .once);
 
     var buf: [8]linux.io_uring_cqe = undefined;
     try testing.expectEqual(@as(u32, 4), try loop.ring.copyCqes(&buf));
@@ -120,7 +122,7 @@ test "the enter deadline ends a tick with nothing in flight" {
 
     var app: App = .{};
     const start = loop.now();
-    try loop.tick(&app, App.onCompletion, .{ .until = start + 20 * std.time.ns_per_ms });
+    _ = try loop.tick(&app, App.onCompletion, .{ .until = start + 20 * std.time.ns_per_ms });
 
     const elapsed = loop.now() - start;
     try testing.expect(elapsed >= 20 * std.time.ns_per_ms);
@@ -139,7 +141,7 @@ test "post dispatches without a kernel completion, one tick later" {
     try loop.post(tag);
 
     var app: App = .{};
-    try loop.tick(&app, App.onCompletion, .no_wait);
+    _ = try loop.tick(&app, App.onCompletion, .no_wait);
     try testing.expectEqual(@as(usize, 1), app.count);
     try testing.expectEqual(@as(usize, 1), app.posted_seen);
     try testing.expectEqual(@as(u16, 1), app.seen[0].slot);
@@ -155,13 +157,13 @@ test "a post from a handler runs on the next tick, never inside the batch" {
     _ = try loop.nop(.{ .op = .send, .slot = 5, .gen = 1 });
 
     var app: App = .{ .post_back = true };
-    try loop.tick(&app, App.onCompletion, .once);
+    _ = try loop.tick(&app, App.onCompletion, .once);
     // The completion was dispatched, and its handler queued one post.
     try testing.expectEqual(@as(usize, 1), app.count);
     try testing.expectEqual(@as(usize, 0), app.posted_seen);
     try testing.expectEqual(@as(usize, 1), loop.posted_len);
 
-    try loop.tick(&app, App.onCompletion, .no_wait);
+    _ = try loop.tick(&app, App.onCompletion, .no_wait);
     try testing.expectEqual(@as(usize, 2), app.count);
     try testing.expectEqual(@as(usize, 1), app.posted_seen);
 }
@@ -231,7 +233,7 @@ test "tick ignores stop, because a shutdown still has work to do" {
 
     // tick still does one pass.
     try loop.post(.{ .op = .timer, .slot = 3, .gen = 1 });
-    try loop.tick(&app, App.onCompletion, .no_wait);
+    _ = try loop.tick(&app, App.onCompletion, .no_wait);
     try testing.expectEqual(@as(usize, 1), app.count);
     try testing.expectEqual(@as(u16, 3), app.seen[0].slot);
 }
@@ -257,8 +259,8 @@ test "a cancel publishes what is still queued, or it finds nothing" {
     _ = try loop.cancel(cancelled, polled, 0);
 
     var app: App = .{};
-    try loop.tick(&app, App.onCompletion, .once);
-    try loop.tick(&app, App.onCompletion, .once);
+    _ = try loop.tick(&app, App.onCompletion, .once);
+    _ = try loop.tick(&app, App.onCompletion, .once);
 
     try testing.expectEqual(@as(usize, 2), app.count);
     // The cancel found the poll, because it was published first.
@@ -267,4 +269,36 @@ test "a cancel publishes what is still queued, or it finds nothing" {
     // And the poll it cancelled ended in ECANCELED.
     try testing.expectEqual(Tag.Op.timer, app.seen[1].op);
     try testing.expectEqual(linux.E.CANCELED, linux.errno(app.results[1]));
+}
+
+test "a tick reports the facts a caller's policy needs" {
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
+    defer loop.deinit();
+
+    var app: App = .{};
+    _ = try loop.nop(.{ .op = .timer, .slot = 1, .gen = 1 });
+
+    // A tick with work already complete does not enter.
+    const busy = try loop.tick(&app, App.onCompletion, .no_wait);
+    try testing.expectEqual(@as(u32, 1), busy.cqes);
+    try testing.expectEqual(@as(u32, 0), busy.posted);
+    try testing.expect(!busy.entered);
+    try testing.expect(!busy.waited);
+    try testing.expect(busy.start_ns <= busy.now_ns);
+
+    // An idle tick enters: under DEFER_TASKRUN that is the only way the
+    // kernel runs its deferred completions.
+    const idle = try loop.tick(&app, App.onCompletion, .no_wait);
+    try testing.expectEqual(@as(u32, 0), idle.cqes);
+    try testing.expect(idle.entered);
+    try testing.expect(!idle.waited);
+
+    // A deadline tick waits, and says so; the timestamps bracket it.
+    const start = loop.now();
+    const until: Wait = .{ .until = start + 10 * std.time.ns_per_ms };
+    const timed = try loop.tick(&app, App.onCompletion, until);
+    try testing.expect(timed.entered);
+    try testing.expect(timed.waited);
+    try testing.expect(timed.now_ns - timed.start_ns >= 10 * std.time.ns_per_ms);
 }

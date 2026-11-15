@@ -199,30 +199,57 @@ pub fn Loop(comptime Tag: type) type {
         /// at comptime, so each completion is a direct call with no function
         /// pointer and no erased context. An error from it is returned from
         /// the tick, and the loop keeps no restart policy: the caller decides.
+        /// What one tick did, for a caller whose policy depends on it: a
+        /// busy-poll gate needs the gap, and the DEFER_TASKRUN rule needs to
+        /// know the kernel ran its deferred completions.
+        pub const Tick = struct {
+            /// Completions from the kernel this tick.
+            cqes: u32,
+            /// Posted tags this tick.
+            posted: u32,
+            /// The tick made a GETEVENTS enter. Under DEFER_TASKRUN this is
+            /// the only way the kernel runs deferred completions.
+            entered: bool,
+            /// That enter blocked for a completion or a deadline.
+            waited: bool,
+            /// The tick's first clock sample.
+            start_ns: i64,
+            /// The tick's last: after the enter when it waited, otherwise when
+            /// dispatch finished.
+            now_ns: i64,
+        };
+
         pub fn tick(
             self: *Self,
             ctx: anytype,
             comptime handler: anytype,
             wait: Wait,
-        ) !void {
+        ) !Tick {
             // No stop check here on purpose. The stop decision belongs to
             // whoever owns the loop's lifetime, and a tick that quietly
             // returns is a hang with no syscall to show for it. A shutdown
             // that has to finish work needs ticks after the decision.
+            const start_ns = clock.monotonic();
+
             // The posted count is a snapshot taken before dispatch: one
             // posted from a handler above runs on the next tick, so a handler
             // that posts cannot starve the enter.
             const posted = self.posted_len;
 
-            // Publish whatever was queued since the last tick before reaping,
-            // so work armed outside a handler is not a tick late.
-            try self.ring.submit();
+            // Publish whatever is queued before reaping, so work armed outside
+            // a handler is not a tick late. The guard is `sqPending`, not a
+            // flag: it counts what std's prep helpers queued too, including
+            // through `ring.inner`, and it is zero when a previous tick
+            // already published, so it costs no syscall.
+            if (self.ring.sqPending() != 0) try self.ring.submit();
 
-            var now_ns = clock.monotonic();
             var reaped: u32 = try self.ring.copyCqes(self.cqes);
+            var entered = false;
+            var waited = false;
+            var now_ns = start_ns;
 
             if (reaped == 0 and posted == 0) {
-                const kernel_start = clock.monotonic();
+                entered = true;
                 switch (wait) {
                     .no_wait => {
                         // Still an enter: under DEFER_TASKRUN, an empty
@@ -233,16 +260,17 @@ pub fn Loop(comptime Tag: type) type {
                         };
                     },
                     .once => {
-                        const waited = self.ring.wait(1, null) catch |err| switch (err) {
+                        waited = true;
+                        const woken = self.ring.wait(1, null) catch |err| switch (err) {
                             // A signal is an external wakeup, not a fault:
                             // nothing was lost, and the next tick retries.
-                            error.SignalInterrupt => return,
+                            error.SignalInterrupt => return error.SignalInterrupt,
                             else => |e| return e,
                         };
-                        if (!waited.timed_out) reaped = try self.ring.copyCqes(self.cqes);
+                        if (!woken.timed_out) reaped = try self.ring.copyCqes(self.cqes);
                     },
                     .until => |deadline_ns| {
-                        const wait_ns: u64 = @intCast(@max(0, deadline_ns - kernel_start));
+                        const wait_ns: u64 = @intCast(@max(0, deadline_ns - start_ns));
                         if (wait_ns == 0) {
                             // The deadline already passed. Poll, which is the
                             // same enter without a wait for a completion that
@@ -252,30 +280,21 @@ pub fn Loop(comptime Tag: type) type {
                                 else => |e| return e,
                             };
                         } else {
-                            const waited = self.ring.wait(1, wait_ns) catch |err| switch (err) {
-                                error.SignalInterrupt => return,
+                            waited = true;
+                            const woken = self.ring.wait(1, wait_ns) catch |err| switch (err) {
+                                error.SignalInterrupt => return error.SignalInterrupt,
                                 else => |e| return e,
                             };
-                            if (!waited.timed_out) reaped = try self.ring.copyCqes(self.cqes);
+                            if (!woken.timed_out) reaped = try self.ring.copyCqes(self.cqes);
                         }
                     },
                 }
-                self.stats.kernel_ns += clock.monotonic() - kernel_start;
-                // Refresh after the sleep: a timestamp taken before it would
-                // stamp the first work of the day with the park's start.
                 now_ns = clock.monotonic();
+                self.stats.kernel_ns += now_ns - start_ns;
             }
             self.now_ns = now_ns;
 
-            const dispatch_start = clock.monotonic();
-            for (self.cqes[0..reaped]) |cqe| {
-                const completion: Cqe = .{
-                    .tag = decode(cqe.user_data),
-                    .res = cqe.res,
-                    .flags = cqe.flags,
-                };
-                try handler(ctx, self, completion);
-            }
+            for (self.cqes[0..reaped]) |cqe| try handler(ctx, self, Self.fromRaw(cqe));
             self.stats.cqes += reaped;
 
             var n = posted;
@@ -286,12 +305,23 @@ pub fn Loop(comptime Tag: type) type {
                 self.stats.posted += 1;
                 try handler(ctx, self, .{ .tag = tag, .res = 0, .flags = 0, .posted = true });
             }
-            self.stats.dispatch_ns += clock.monotonic() - dispatch_start;
+
+            const end_ns = clock.monotonic();
+            self.stats.dispatch_ns += end_ns - now_ns;
             self.stats.ticks += 1;
 
             // One submit per tick, whatever the handlers queued. This is the
             // line that replaces a submit call at every arm site.
-            try self.ring.submit();
+            if (self.ring.sqPending() != 0) try self.ring.submit();
+
+            return .{
+                .cqes = reaped,
+                .posted = @intCast(posted),
+                .entered = entered,
+                .waited = waited,
+                .start_ns = start_ns,
+                .now_ns = end_ns,
+            };
         }
 
         /// `tick` until `stop`. The waiting mode is comptime, so a run that
@@ -309,7 +339,7 @@ pub fn Loop(comptime Tag: type) type {
             comptime handler: anytype,
             comptime wait: Wait,
         ) !void {
-            while (!self.stopped) try self.tick(ctx, handler, wait);
+            while (!self.stopped) _ = try self.tick(ctx, handler, wait);
         }
 
         /// A blank SQE with this tag: the escape hatch for an operation the
