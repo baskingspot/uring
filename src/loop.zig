@@ -60,12 +60,11 @@ pub fn Loop(comptime Tag: type) type {
             /// operation finished, and `res` is zero.
             posted: bool = false,
 
-            /// The errno in `res`, or `.SUCCESS`.
+            /// The errno in `res`, or `.SUCCESS`. An io_uring result uses the
+            /// syscall convention, so this is the std decoder and not a
+            /// second copy of it.
             pub fn errno(self: *const Cqe) linux.E {
-                if (self.res > -4096 and self.res < 0) {
-                    return @fromBackingInt(@intCast(-self.res));
-                }
-                return .SUCCESS;
+                return linux.errno(self.res);
             }
 
             /// The operation that produced this completion is still armed and
