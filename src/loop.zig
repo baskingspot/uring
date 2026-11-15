@@ -157,6 +157,13 @@ pub fn Loop(comptime Tag: type) type {
             };
         }
 
+        /// The loop's view of one kernel completion. For a caller that copies
+        /// the completion queue itself instead of going through `tick`, which
+        /// is the only other place that decodes a tag from a CQE.
+        pub fn fromRaw(raw: linux.io_uring_cqe) Cqe {
+            return .{ .tag = decode(raw.user_data), .res = raw.res, .flags = raw.flags };
+        }
+
         /// The monotonic timestamp of this tick, in nanoseconds. It is read
         /// once per tick and after the enter, so every timestamp a handler
         /// takes from here agrees within one tick.
