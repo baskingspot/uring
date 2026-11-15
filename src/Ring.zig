@@ -32,10 +32,6 @@ pub const default_flags: u32 = linux.IORING_SETUP_DEFER_TASKRUN |
 
 inner: linux.IoUring,
 entries: u16,
-/// SQEs prepped since the last submit. std's prep helpers queue into the
-/// shared ring without telling us, so the loop keeps the fact itself and
-/// submits once per tick instead of once per operation.
-dirty: bool = false,
 
 pub const EnterError = error{
     /// The kernel ran out of memory or resources. Wait for completions and retry.
@@ -87,7 +83,6 @@ pub fn sqe(self: *Ring, user_data: u64) !*linux.io_uring_sqe {
     const slot = try self.getSqe();
     slot.* = mem.zeroes(linux.io_uring_sqe);
     slot.user_data = user_data;
-    self.dirty = true;
     return slot;
 }
 
@@ -97,7 +92,6 @@ fn getSqe(self: *Ring) !*linux.io_uring_sqe {
         // the kernel consume its side of the queue before we ask again.
         error.SubmissionQueueFull => blk: {
             _ = try self.inner.submit();
-            self.dirty = false;
             break :blk try self.inner.get_sqe();
         },
         else => |e| return e,
@@ -105,10 +99,12 @@ fn getSqe(self: *Ring) !*linux.io_uring_sqe {
 }
 
 /// Publish the queued SQEs. Never blocks and never waits for a completion.
+///
+/// It always enters, even with nothing obvious to publish: SQE prep can happen
+/// through `inner` without the ring noticing, so a conditional submit would
+/// strand those operations. std's `submit` is the contract.
 pub fn submit(self: *Ring) !void {
-    if (!self.dirty) return;
     _ = try self.inner.submit();
-    self.dirty = false;
 }
 
 /// Run the completions the kernel deferred without waiting for one. Under
@@ -217,9 +213,7 @@ test "a prepped SQE is one submit away and its user_data survives" {
     defer ring.deinit();
 
     _ = try ring.sqe(0xDEAD_BEEF);
-    try testing.expect(ring.dirty);
     try ring.submit();
-    try testing.expect(!ring.dirty);
 
     var buf: [8]linux.io_uring_cqe = undefined;
     const waited = try ring.wait(1, 2 * std.time.ns_per_s);

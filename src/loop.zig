@@ -445,10 +445,7 @@ pub fn Loop(comptime Tag: type) type {
         /// After the enter behind `submit`, the kernel has consumed its side
         /// and the next prep has room.
         inline fn room(self: *Self) !void {
-            if (self.ring.available() < self.sq_floor) {
-                _ = try self.ring.inner.submit();
-            }
-            self.ring.dirty = true;
+            if (self.ring.available() < self.sq_floor) try self.ring.submit();
         }
     };
 }
