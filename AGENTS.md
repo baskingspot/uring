@@ -32,9 +32,10 @@ design, and it is what to protect in review: no field in `Loop` may mean
 
 Two things this loop must never do, both learned the hard way in handoff:
 
-- Hand a zero timeout to `io_uring_enter`. The kernel reads a zero timeout as
-  no timeout, so a deadline in the past becomes an infinite sleep. A passed
-  deadline polls instead.
+- Let `now()` read zero. A fresh loop with a zeroed clock turns every
+  "deadline in `timeout` from now" into a deadline long past. The clock is
+  sampled in `init` for that reason. A deadline already past polls instead of
+  asking the kernel to wait for a completion that cannot arrive first.
 - Reap before submitting. Work armed outside a handler is otherwise a tick
   late, and a caller bursts ops before its first tick.
 

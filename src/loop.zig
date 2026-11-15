@@ -229,10 +229,9 @@ pub fn Loop(comptime Tag: type) type {
                     .until => |deadline_ns| {
                         const wait_ns: u64 = @intCast(@max(0, deadline_ns - kernel_start));
                         if (wait_ns == 0) {
-                            // The deadline already passed. Poll instead of
-                            // asking for a zero timeout: the kernel reads a
-                            // zero timeout as no timeout, and this would
-                            // sleep until a completion that may never come.
+                            // The deadline already passed. Poll, which is the
+                            // same enter without a wait for a completion that
+                            // cannot arrive before it.
                             self.ring.poll() catch |err| switch (err) {
                                 error.SignalInterrupt => {},
                                 else => |e| return e,
