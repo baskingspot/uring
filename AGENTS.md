@@ -10,7 +10,10 @@ An io_uring completion loop for Zig: one ring, one tick, and a user_data type yo
 
 Zig 0.17, the current stable. The flake is the tool contract, from `baskingspot/nix`: `nix develop` provides Zig, `ziglint`, and the base tools, and nothing comes from the system PATH. The justfile is the command interface: `just test`, `just lint`, `just ci`. Run `just fmt` before you commit.
 
-A repo that must also build on the previous release follows the dual-version pattern: import `zig."0.16"` and `zig."0.17"`, give the older one its own `zig-old` shell, hold the shims in `src/compat.zig`, run `just ci` on the default shell and `just check` on the compatibility lane, and set `minimum_zig_version` to the older one. `baskingspot/cli`, `baskingspot/json5`, and `baskingspot/toml` do that today. Write down which versions the repo supports here, in this paragraph, so there is one place to look.
+Zig 0.17 only, and it stays that way. The encoding layer is
+`std.os.linux.IoUring`, whose API moved between 0.16 and 0.17, and the library
+exists to delete scaffolding from a 0.17 consumer. A 0.16 shim would be a
+second io_uring surface to keep honest for nobody.
 
 ## Rules
 
@@ -20,6 +23,24 @@ A repo that must also build on the previous release follows the dual-version pat
 - A dependency a user does not need is lazy. Call `b.lazyDependency`, and put every use that needs a value inside `if (dep) |d| { ... }`. The first configure pass returns null, and the build runner fetches the package after it. An unwrap outside that block panics, and it reads as a broken build script. A warm `zig-pkg` hides this, so check with `rm -rf zig-pkg .zig-cache && zig build test`.
 - This repo's GitHub settings come from `baskingspot/.github`, with `just settings`. Do not change them by hand.
 - To graduate the project, follow the `baskingspot-new-repo` skill: logos, a real README, and the audit passing.
+
+## The loop's contract
+
+The tag is the caller's, and the loop never interprets it. That is the whole
+design, and it is what to protect in review: no field in `Loop` may mean
+"connection", no handler may be called indirectly, and no path may allocate.
+
+Two things this loop must never do, both learned the hard way in handoff:
+
+- Hand a zero timeout to `io_uring_enter`. The kernel reads a zero timeout as
+  no timeout, so a deadline in the past becomes an infinite sleep. A passed
+  deadline polls instead.
+- Reap before submitting. Work armed outside a handler is otherwise a tick
+  late, and a caller bursts ops before its first tick.
+
+`sq_floor` exists for the same family of reason: a prep that finds the
+submission queue full loses the operation, so the loop publishes early instead
+of at the edge.
 
 ## Changelog
 
