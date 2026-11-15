@@ -60,11 +60,20 @@ pub const Waited = struct {
     timed_out: bool,
 };
 
+pub const InitError = error{
+    /// The kernel has no IORING_FEAT_EXT_ARG, so `enter` cannot take a
+    /// deadline. 5.11 or newer.
+    KernelTooOld,
+};
+
 pub fn init(entries: u16, flags: u32) !Ring {
-    return .{
-        .inner = try .init(entries, flags),
-        .entries = entries,
-    };
+    var inner = try linux.IoUring.init(entries, flags);
+    errdefer inner.deinit();
+    // Every wait in this library enters with IORING_ENTER_EXT_ARG. Without the
+    // feature the enter fails as EINVAL, which reads as a malformed SQE and
+    // sends the reader hunting the wrong bug.
+    if (inner.features & linux.IORING_FEAT_EXT_ARG == 0) return error.KernelTooOld;
+    return .{ .inner = inner, .entries = entries };
 }
 
 pub fn deinit(self: *Ring) void {
