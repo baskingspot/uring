@@ -195,9 +195,6 @@ test "run ticks until a handler stops it" {
     // stop() is checked between ticks, not inside a batch: a completion that
     // arrived is work that happened, and the rest of the batch still runs.
     try testing.expectEqual(@as(usize, 2), app.count);
-
-    try loop.tick(&app, App.onCompletion, .no_wait);
-    try testing.expectEqual(@as(usize, 2), app.count);
 }
 
 test "an error from a handler returns from the tick and the loop keeps its batch" {
@@ -211,4 +208,28 @@ test "an error from a handler returns from the tick and the loop keeps its batch
     try testing.expectError(error.BatchFull, loop.tick(&app, App.onCompletion, .once));
     // Not stopped: the caller decides whether a handler error ends the program.
     try testing.expect(!loop.isStopped());
+}
+
+test "tick ignores stop, because a shutdown still has work to do" {
+    // The drain shape: the app decided to finish, and still has to serve the
+    // connections it holds. A tick that no-ops after stop would make that
+    // impossible without a second flag.
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var ready: [4]Tag = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .ready = &ready });
+    defer loop.deinit();
+
+    var app: App = .{};
+    loop.stop();
+    try testing.expect(loop.isStopped());
+
+    // run does nothing now.
+    try loop.run(&app, App.onCompletion, .no_wait);
+    try testing.expectEqual(@as(usize, 0), app.count);
+
+    // tick still does one pass.
+    try loop.post(.{ .op = .timer, .slot = 3, .gen = 1 });
+    try loop.tick(&app, App.onCompletion, .no_wait);
+    try testing.expectEqual(@as(usize, 1), app.count);
+    try testing.expectEqual(@as(u16, 3), app.seen[0].slot);
 }

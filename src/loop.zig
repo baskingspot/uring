@@ -17,8 +17,8 @@ const linux = std.os.linux;
 const posix = std.posix;
 const assert = std.debug.assert;
 
-const Ring = @import("Ring.zig").Ring;
 const clock = @import("clock.zig");
+const Ring = @import("Ring.zig").Ring;
 
 pub fn Loop(comptime Tag: type) type {
     if (@bitSizeOf(Tag) != 64) {
@@ -61,7 +61,7 @@ pub fn Loop(comptime Tag: type) type {
             deferred: bool = false,
 
             /// The errno in `res`, or `.SUCCESS`.
-            pub fn errno(self: Cqe) linux.E {
+            pub fn errno(self: *const Cqe) linux.E {
                 if (self.res > -4096 and self.res < 0) {
                     return @fromBackingInt(@intCast(-self.res));
                 }
@@ -94,15 +94,23 @@ pub fn Loop(comptime Tag: type) type {
         };
 
         pub const Stats = struct {
-            ticks: u64 = 0,
+            ticks: u64,
             /// Completions the kernel delivered.
-            cqes: u64 = 0,
+            cqes: u64,
             /// Tags the loop synthesized from `post`.
-            deferred: u64 = 0,
+            deferred: u64,
             /// Time inside the enter.
-            kernel_ns: i64 = 0,
+            kernel_ns: i64,
             /// Time inside the caller's handler.
-            dispatch_ns: i64 = 0,
+            dispatch_ns: i64,
+
+            const zero: Stats = .{
+                .ticks = 0,
+                .cqes = 0,
+                .deferred = 0,
+                .kernel_ns = 0,
+                .dispatch_ns = 0,
+            };
         };
 
         ring: Ring,
@@ -113,7 +121,7 @@ pub fn Loop(comptime Tag: type) type {
         sq_floor: u16,
         now_ns: i64 = 0,
         stopped: bool = false,
-        stats: Stats = .{},
+        stats: Stats = .zero,
 
         pub fn init(options: Options) !Self {
             if (options.cqes.len == 0) return error.NoCompletionBatch;
@@ -131,6 +139,7 @@ pub fn Loop(comptime Tag: type) type {
 
         pub fn deinit(self: *Self) void {
             self.ring.deinit();
+            self.* = undefined;
         }
 
         /// The tag as the ring sees it. `@bitCast` for everything that is
@@ -156,8 +165,14 @@ pub fn Loop(comptime Tag: type) type {
             return self.now_ns;
         }
 
-        /// Stop after this tick's dispatch. A stopped loop still drains its
-        /// batch: a completion that arrived is work that happened.
+        /// Ask the loop to finish. `run` honors this at its next tick
+        /// boundary, and the batch it is in still drains: a completion that
+        /// arrived is work that happened. A caller that drives `tick` itself
+        /// reads `isStopped` and decides, which is what lets a shutdown keep
+        /// serving its last connections.
+        ///
+        /// Idempotent on purpose: two completions in one batch can each
+        /// decide the loop is done, and that is not a bug in the caller.
         pub fn stop(self: *Self) void {
             self.stopped = true;
         }
@@ -192,8 +207,10 @@ pub fn Loop(comptime Tag: type) type {
             comptime handler: anytype,
             wait: Wait,
         ) !void {
-            if (self.stopped) return;
-
+            // No stop check here on purpose. The stop decision belongs to
+            // whoever owns the loop's lifetime, and a tick that quietly
+            // returns is a hang with no syscall to show for it. A shutdown
+            // that has to finish work needs ticks after the decision.
             // The posted count is a snapshot taken before dispatch: one
             // posted from a handler above runs on the next tick, so a handler
             // that posts cannot starve the enter.
@@ -279,8 +296,15 @@ pub fn Loop(comptime Tag: type) type {
             try self.ring.submit();
         }
 
-        /// `tick` until `stop`. The waiting mode is comptime so a caller that
+        /// `tick` until `stop`. The waiting mode is comptime, so a run that
         /// never blocks pays no branch for it.
+        ///
+        /// `Wait.until` is one absolute deadline for the whole run, not a
+        /// timeout per tick: the value is fixed when `run` is called, so
+        /// `.{ .until = now + 50ms }` means "run for 50 ms" and spins after
+        /// that. A deadline that moves, such as a connection's idle timeout,
+        /// means calling `tick` in the caller's own loop with a deadline
+        /// computed from the loop's clock each pass.
         pub fn run(
             self: *Self,
             ctx: anytype,

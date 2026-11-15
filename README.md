@@ -27,10 +27,16 @@ defer loop.deinit();
 
 _ = try loop.recv(.{ .op = 1, .slot = 7, .gen = 1 }, fd, .{ .buffer = buf }, 0);
 
+// One pass per call. The deadline is the caller's, computed from the loop's
+// clock every tick, because a moving deadline is application state.
 while (!loop.isStopped()) {
-    try loop.tick(&server, Server.onCompletion, .{ .until = loop.now() + 50 * std.time.ns_per_ms });
+    const next = server.nextDeadline(loop.now());
+    try loop.tick(&server, Server.onCompletion, .{ .until = next });
 }
 ```
+
+A program with no deadlines of its own calls `run` instead, which ticks until
+`stop`.
 
 Deadlines ride the enter, not an operation: `io_uring_enter` takes a timeout
 through `IORING_ENTER_EXT_ARG`, so moving a deadline costs no submission and no
