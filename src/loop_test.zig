@@ -191,7 +191,7 @@ test "run ticks until a handler stops it" {
     var app: App = .{ .stop_at = 1 };
     try loop.run(&app, App.onCompletion, .no_wait);
 
-    try testing.expect(loop.isStopped());
+    try testing.expect(loop.stopped);
     // stop() is checked between ticks, not inside a batch: a completion that
     // arrived is work that happened, and the rest of the batch still runs.
     try testing.expectEqual(@as(usize, 2), app.count);
@@ -207,7 +207,7 @@ test "an error from a handler returns from the tick and the loop keeps its batch
     var app: App = .{ .count = 16 };
     try testing.expectError(error.BatchFull, loop.tick(&app, App.onCompletion, .once));
     // Not stopped: the caller decides whether a handler error ends the program.
-    try testing.expect(!loop.isStopped());
+    try testing.expect(!loop.stopped);
 }
 
 test "tick ignores stop, because a shutdown still has work to do" {
@@ -221,7 +221,7 @@ test "tick ignores stop, because a shutdown still has work to do" {
 
     var app: App = .{};
     loop.stop();
-    try testing.expect(loop.isStopped());
+    try testing.expect(loop.stopped);
 
     // run does nothing now.
     try loop.run(&app, App.onCompletion, .no_wait);

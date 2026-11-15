@@ -29,7 +29,7 @@ _ = try loop.recv(.{ .op = 1, .slot = 7, .gen = 1 }, fd, .{ .buffer = buf }, 0);
 
 // One pass per call. The deadline is the caller's, computed from the loop's
 // clock every tick, because a moving deadline is application state.
-while (!loop.isStopped()) {
+while (!loop.stopped) {
     const next = server.nextDeadline(loop.now());
     try loop.tick(&server, Server.onCompletion, .{ .until = next });
 }

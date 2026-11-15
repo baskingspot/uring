@@ -168,17 +168,13 @@ pub fn Loop(comptime Tag: type) type {
         /// Ask the loop to finish. `run` honors this at its next tick
         /// boundary, and the batch it is in still drains: a completion that
         /// arrived is work that happened. A caller that drives `tick` itself
-        /// reads `isStopped` and decides, which is what lets a shutdown keep
+        /// reads `stopped` and decides, which is what lets a shutdown keep
         /// serving its last connections.
         ///
         /// Idempotent on purpose: two completions in one batch can each
         /// decide the loop is done, and that is not a bug in the caller.
         pub fn stop(self: *Self) void {
             self.stopped = true;
-        }
-
-        pub fn isStopped(self: *const Self) bool {
-            return self.stopped;
         }
 
         /// Post `tag` for dispatch on the next tick, as though it completed.
