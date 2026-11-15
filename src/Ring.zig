@@ -72,6 +72,11 @@ pub fn deinit(self: *Ring) void {
     self.* = undefined;
 }
 
+/// SQEs prepped but not published yet.
+pub fn sqPending(self: *Ring) u32 {
+    return self.inner.sq.sqe_tail -% self.inner.sq.sqe_head;
+}
+
 /// The room left in the submission queue.
 pub fn available(self: *Ring) u32 {
     return @as(u32, self.entries) -| self.inner.sq_ready();

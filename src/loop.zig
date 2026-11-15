@@ -395,12 +395,17 @@ pub fn Loop(comptime Tag: type) type {
             return self.ring.inner.close(Self.encode(tag), fd);
         }
 
+        /// Cancel a request by its tag. A cancel finds only requests the
+        /// kernel already holds, so the queued submissions go out first:
+        /// without that, cancelling an operation armed moments ago returns
+        /// ENOENT and the target runs on.
         pub fn cancel(
             self: *Self,
             tag: Tag,
             target: Tag,
             flags: u32,
         ) !*linux.io_uring_sqe {
+            if (self.ring.sqPending() != 0) try self.ring.submit();
             try self.room();
             return self.ring.inner.cancel(Self.encode(tag), Self.encode(target), flags);
         }

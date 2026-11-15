@@ -21,6 +21,7 @@ const Tag = packed struct(u64) {
 
 const App = struct {
     seen: [16]Tag = undefined,
+    results: [16]i32 = undefined,
     count: usize = 0,
     posted_seen: usize = 0,
     stop_at: usize = 0,
@@ -29,6 +30,7 @@ const App = struct {
     fn onCompletion(app: *App, loop: *Loop(Tag), cqe: Loop(Tag).Cqe) !void {
         if (app.count == app.seen.len) return error.BatchFull;
         app.seen[app.count] = cqe.tag;
+        app.results[app.count] = cqe.res;
         app.count += 1;
         if (cqe.posted) app.posted_seen += 1;
         if (app.post_back and cqe.tag.op == .send) try loop.post(cqe.tag);
@@ -232,4 +234,37 @@ test "tick ignores stop, because a shutdown still has work to do" {
     try loop.tick(&app, App.onCompletion, .no_wait);
     try testing.expectEqual(@as(usize, 1), app.count);
     try testing.expectEqual(@as(u16, 3), app.seen[0].slot);
+}
+
+test "a cancel publishes what is still queued, or it finds nothing" {
+    var fds: [2]linux.fd_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
+    defer loop.deinit();
+
+    const polled: Tag = .{ .op = .timer, .slot = 1, .gen = 1 };
+    const cancelled: Tag = .{ .op = .send, .slot = 2, .gen = 1 };
+
+    // An empty pipe never becomes readable, and nothing is submitted: the
+    // poll is in the userspace queue when the cancel is prepped.
+    _ = try loop.pollAdd(polled, fds[0], linux.POLL.IN);
+    try testing.expect(loop.ring.sqPending() != 0);
+    _ = try loop.cancel(cancelled, polled, 0);
+
+    var app: App = .{};
+    try loop.tick(&app, App.onCompletion, .once);
+    try loop.tick(&app, App.onCompletion, .once);
+
+    try testing.expectEqual(@as(usize, 2), app.count);
+    // The cancel found the poll, because it was published first.
+    try testing.expectEqual(Tag.Op.send, app.seen[0].op);
+    try testing.expectEqual(@as(i32, 0), app.results[0]);
+    // And the poll it cancelled ended in ECANCELED.
+    try testing.expectEqual(Tag.Op.timer, app.seen[1].op);
+    try testing.expectEqual(linux.E.CANCELED, linux.errno(app.results[1]));
 }
