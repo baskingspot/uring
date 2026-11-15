@@ -7,7 +7,7 @@
 //! when.
 //!
 //! What the loop owns: the ring, the submit discipline, the enter, the cached
-//! clock, the deferred queue, and the one decode from `user_data` to `Tag`.
+//! clock, the posted queue, and the one decode from `user_data` to `Tag`.
 //! What it refuses: buffers, fds, connection state, close ordering, and any
 //! opinion about what a completion means. It never closes a descriptor, never
 //! frees a byte, and never rearms an operation.
@@ -42,7 +42,7 @@ pub fn Loop(comptime Tag: type) type {
             cqes: []linux.io_uring_cqe,
             /// The posted queue, one slot per pending `post`. A zero-length
             /// slice disables `post`.
-            ready: []Tag = &.{},
+            posted: []Tag = &.{},
             /// Flush the submission queue once this many slots are left. A
             /// prep that finds the queue full loses the operation, so the
             /// loop publishes early rather than at the edge.
@@ -58,7 +58,7 @@ pub fn Loop(comptime Tag: type) type {
             flags: u32,
             /// True when the loop synthesized this from `post`: no kernel
             /// operation finished, and `res` is zero.
-            deferred: bool = false,
+            posted: bool = false,
 
             /// The errno in `res`, or `.SUCCESS`.
             pub fn errno(self: *const Cqe) linux.E {
@@ -98,7 +98,7 @@ pub fn Loop(comptime Tag: type) type {
             /// Completions the kernel delivered.
             cqes: u64,
             /// Tags the loop synthesized from `post`.
-            deferred: u64,
+            posted: u64,
             /// Time inside the enter.
             kernel_ns: i64,
             /// Time inside the caller's handler.
@@ -107,7 +107,7 @@ pub fn Loop(comptime Tag: type) type {
             const zero: Stats = .{
                 .ticks = 0,
                 .cqes = 0,
-                .deferred = 0,
+                .posted = 0,
                 .kernel_ns = 0,
                 .dispatch_ns = 0,
             };
@@ -115,9 +115,9 @@ pub fn Loop(comptime Tag: type) type {
 
         ring: Ring,
         cqes: []linux.io_uring_cqe,
-        ready: []Tag,
-        ready_head: usize = 0,
-        ready_len: usize = 0,
+        posted: []Tag,
+        posted_head: usize = 0,
+        posted_len: usize = 0,
         sq_floor: u16,
         now_ns: i64 = 0,
         stopped: bool = false,
@@ -129,7 +129,7 @@ pub fn Loop(comptime Tag: type) type {
             return .{
                 .ring = try .init(options.entries, options.flags),
                 .cqes = options.cqes,
-                .ready = options.ready,
+                .posted = options.posted,
                 .sq_floor = options.sq_floor,
                 // A deadline computed from a zeroed clock is a deadline in
                 // the past, so the clock starts at init, not at the first tick.
@@ -180,15 +180,11 @@ pub fn Loop(comptime Tag: type) type {
         /// Post `tag` for dispatch on the next tick, as though it completed.
         /// A post from inside a handler runs one tick later, never in the
         /// middle of the current batch.
-        pub fn post(self: *Self, tag: Tag) error{DeferredFull}!void {
-            if (self.ready_len == self.ready.len) return error.DeferredFull;
-            const tail = (self.ready_head + self.ready_len) % self.ready.len;
-            self.ready[tail] = tag;
-            self.ready_len += 1;
-        }
-
-        pub fn postedLen(self: *const Self) usize {
-            return self.ready_len;
+        pub fn post(self: *Self, tag: Tag) error{PostedFull}!void {
+            if (self.posted_len == self.posted.len) return error.PostedFull;
+            const tail = (self.posted_head + self.posted_len) % self.posted.len;
+            self.posted[tail] = tag;
+            self.posted_len += 1;
         }
 
         /// One tick: wait, reap, dispatch, post, submit.
@@ -210,7 +206,7 @@ pub fn Loop(comptime Tag: type) type {
             // The posted count is a snapshot taken before dispatch: one
             // posted from a handler above runs on the next tick, so a handler
             // that posts cannot starve the enter.
-            const posted = self.ready_len;
+            const posted = self.posted_len;
 
             // Publish whatever was queued since the last tick before reaping,
             // so work armed outside a handler is not a tick late.
@@ -278,11 +274,11 @@ pub fn Loop(comptime Tag: type) type {
 
             var n = posted;
             while (n > 0) : (n -= 1) {
-                const tag = self.ready[self.ready_head];
-                self.ready_head = (self.ready_head + 1) % self.ready.len;
-                self.ready_len -= 1;
-                self.stats.deferred += 1;
-                try handler(ctx, self, .{ .tag = tag, .res = 0, .flags = 0, .deferred = true });
+                const tag = self.posted[self.posted_head];
+                self.posted_head = (self.posted_head + 1) % self.posted.len;
+                self.posted_len -= 1;
+                self.stats.posted += 1;
+                try handler(ctx, self, .{ .tag = tag, .res = 0, .flags = 0, .posted = true });
             }
             self.stats.dispatch_ns += clock.monotonic() - dispatch_start;
             self.stats.ticks += 1;
