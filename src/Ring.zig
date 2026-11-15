@@ -202,7 +202,7 @@ pub fn copyCqes(self: *Ring, buf: []linux.io_uring_cqe) !u32 {
     return self.inner.copy_cqes(buf, 0);
 }
 
-pub fn cqReady(self: *const Ring) u32 {
+pub fn cqReady(self: *Ring) u32 {
     return self.inner.cq_ready();
 }
 
