@@ -34,6 +34,26 @@ fmt:
     oxfmt README.md AGENTS.md .github
     just --fmt
 
+[group("docs")]
+doc: api
+    baskingspot-docs build uring
+
+[doc("Edit the guide with live reload (http://127.0.0.1:1111), API reference included")]
+[group("docs")]
+guide: api
+    baskingspot-docs serve uring
+
+# The API reference data. docgen comes from the baskingspot flake's docs shell,
+# so this is not a Zig build dependency.
+[private]
+api:
+    docgen --root src/root.zig --title uring --repo-url https://github.com/baskingspot/uring --rev main --format json --out docs/data
+
+[doc("Deploy the rendered docs to Cloudflare as an assets-only Worker (config in wrangler.jsonc). Needs CLOUDFLARE_API_TOKEN in the environment")]
+[group("docs")]
+doc-deploy: doc
+    wrangler deploy
+
 [doc("Everything CI runs")]
 [group("ci")]
-ci: test lint
+ci: test lint doc
