@@ -5,6 +5,17 @@ All notable changes to uring are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
+### Added
+
+- `Loop.tickStarting(ctx, before_dispatch, handler, wait)`: `tick` with a hook
+  that runs once per pass, after the enter and before the first handler,
+  receiving the pass's `Tick`. A caller whose handlers read a cached clock
+  settles it there; sampling after `tick` returns leaves every handler on the
+  previous pass's time, and sampling before it stamps a post-wake batch with
+  the park-start time. `tick` is this with `null`, and pays nothing for it.
+
 ## [0.1.0] - 2026-11-16
 
 ### Added
