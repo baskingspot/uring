@@ -10,16 +10,16 @@ default:
 test:
     zig build test --summary all
 
-[doc("Compare the loop against the hand-written loop. `just bench` runs every case; `just bench dispatch loop` runs one side of one case, for perf")]
+[doc("Run the benchmarks (testingx, ReleaseFast): the loop against the hand-written loop. `just bench -- --filter=Batch` picks a group")]
 [group("test")]
 bench *ARGS:
-    zig build bench -Doptimize=ReleaseFast -- {{ ARGS }}
+    zig build bench -- {{ ARGS }}
 
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:
     ziglint
-    zig fmt --check src build.zig
+    zig fmt --check src bench build.zig
     nix fmt -- --ci
     oxfmt --check README.md AGENTS.md .github
     actionlint
@@ -29,7 +29,7 @@ lint:
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
-    zig fmt src build.zig
+    zig fmt src bench build.zig
     nix fmt
     oxfmt README.md AGENTS.md .github
     just --fmt

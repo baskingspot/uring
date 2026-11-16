@@ -300,7 +300,7 @@ test "a tick reports the facts a caller's policy needs" {
     const timed = try loop.tick(&app, App.onCompletion, until);
     try testing.expect(timed.entered);
     try testing.expect(timed.waited);
-    try testing.expect(loop.now() - start >= 10 * std.time.ns_per_ms);
+    try testing.expect(timed.now_ns - timed.start_ns >= 10 * std.time.ns_per_ms);
 }
 
 test "a polling tick reaps what its own poll revealed" {
@@ -357,18 +357,4 @@ test "a poll tick enters even when a completion is already visible" {
     try testing.expect(polled.entered);
     try testing.expect(!polled.waited);
     try testing.expectEqual(@as(u32, 1), polled.cqes);
-}
-
-test "the enter's timing is opt-in, because it is a second clock read" {
-    var cqes: [8]linux.io_uring_cqe = undefined;
-    var plain: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
-    defer plain.deinit();
-    var app: App = .{};
-    _ = try plain.tick(&app, App.onCompletion, .no_wait);
-    try testing.expectEqual(@as(i64, 0), plain.stats.kernel_ns);
-
-    var timed: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .time_kernel = true });
-    defer timed.deinit();
-    _ = try timed.tick(&app, App.onCompletion, .no_wait);
-    try testing.expect(timed.stats.kernel_ns > 0);
 }

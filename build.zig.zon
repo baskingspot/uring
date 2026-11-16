@@ -3,10 +3,19 @@
     .version = "0.0.0",
     .fingerprint = 0x5988b2c8192a21f8, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .testingx = .{
+            .url = "https://baskingspot.dev/testingx/v0.4.0.tar.gz",
+            .hash = "testingx-0.4.0-ib95-2JkAwDVM639ma-akYafT4bdewLfpFaAEnLBzQXG",
+            // Benchmarks only, and only when this is the root package: a
+            // consumer of uring never resolves the runner.
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "bench",
     },
 }

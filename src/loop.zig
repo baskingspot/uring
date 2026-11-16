@@ -47,10 +47,6 @@ pub fn Loop(comptime Tag: type) type {
             /// prep that finds the queue full loses the operation, so the
             /// loop publishes early rather than at the edge.
             sq_floor: u16 = 8,
-            /// Time the enter, for `Stats.kernel_ns`. Off: one clock read
-            /// per tick, which is all a `Tick` needs. On: a second read per
-            /// tick, around the enter only.
-            time_kernel: bool = false,
         };
 
         pub const Cqe = struct {
@@ -108,15 +104,11 @@ pub fn Loop(comptime Tag: type) type {
             cqes: u64,
             /// Tags the loop synthesized from `post`.
             posted: u64,
-            /// Time inside the enter. Sampled only when `Options.stats` is
-            /// set: it costs a second clock read per tick.
-            kernel_ns: i64,
 
             const zero: Stats = .{
                 .ticks = 0,
                 .cqes = 0,
                 .posted = 0,
-                .kernel_ns = 0,
             };
         };
 
@@ -126,7 +118,7 @@ pub fn Loop(comptime Tag: type) type {
         posted_head: usize = 0,
         posted_len: usize = 0,
         sq_floor: u16,
-        kernel_timing: bool,
+        now_ns: i64 = 0,
         stopped: bool = false,
         stats: Stats = .zero,
 
@@ -138,7 +130,9 @@ pub fn Loop(comptime Tag: type) type {
                 .cqes = options.cqes,
                 .posted = options.posted,
                 .sq_floor = options.sq_floor,
-                .kernel_timing = options.time_kernel,
+                // A deadline computed from a zeroed clock is in the past, so
+                // the clock starts at init.
+                .now_ns = clock.monotonic(),
             };
         }
 
@@ -170,11 +164,12 @@ pub fn Loop(comptime Tag: type) type {
             return .{ .tag = decode(raw.user_data), .res = raw.res, .flags = raw.flags };
         }
 
-        /// Monotonic nanoseconds, read now. The loop samples no clock for
-        /// you: a caller that wants timestamps asks, and a caller that does
-        /// not pays nothing. Take it once per tick and reuse it for the batch.
-        pub fn now(_: *Self) i64 {
-            return clock.monotonic();
+        /// The monotonic timestamp of this tick, in nanoseconds. It is read
+        /// once per tick, after the enter, so it is also the moment the kernel
+        /// finished the work the tick waited on. Every timestamp a handler
+        /// takes from here agrees within one tick.
+        pub fn now(self: *const Self) i64 {
+            return self.now_ns;
         }
 
         /// Ask the loop to finish. `run` honors this at its next tick
@@ -218,6 +213,12 @@ pub fn Loop(comptime Tag: type) type {
             entered: bool,
             /// That enter blocked for a completion or a deadline.
             waited: bool,
+            /// When the tick started, before the enter.
+            start_ns: i64,
+            /// When the kernel's work became visible: after the enter, or the
+            /// tick's start when it did not enter. `now_ns - start_ns` is what
+            /// the tick spent entering and dispatching.
+            now_ns: i64,
         };
 
         pub fn tick(
@@ -230,9 +231,11 @@ pub fn Loop(comptime Tag: type) type {
             // whoever owns the loop's lifetime, and a tick that quietly
             // returns is a hang with no syscall to show for it. A shutdown
             // that has to finish work needs ticks after the decision.
-            // The kernel's read is the enter; timing it is opt-in, and it is
-            // the only reason a tick reads the clock at all.
-            const before_enter = if (self.kernel_timing) clock.monotonic() else 0;
+            //
+            // The tick's span needs a sample on each side of the enter:
+            // callers that measure an idle gap would otherwise have to sample
+            // the clock themselves, in every case.
+            const start_ns = clock.monotonic();
 
             // The posted count is a snapshot taken before dispatch: one
             // posted from a handler above runs on the next tick, so a handler
@@ -259,9 +262,6 @@ pub fn Loop(comptime Tag: type) type {
                         else => |e| return e,
                     };
                     reaped = try self.ring.copyCqes(self.cqes);
-                    if (self.kernel_timing) {
-                        self.stats.kernel_ns += clock.monotonic() - before_enter;
-                    }
                 },
                 .no_wait, .once, .until => {
                     reaped = try self.ring.copyCqes(self.cqes);
@@ -313,12 +313,14 @@ pub fn Loop(comptime Tag: type) type {
                         // becomes visible at all under DEFER_TASKRUN. Reap
                         // them now, not next tick.
                         reaped = try self.ring.copyCqes(self.cqes);
-                        if (self.kernel_timing) {
-                            self.stats.kernel_ns += clock.monotonic() - before_enter;
-                        }
                     }
                 },
             }
+
+            // After the enter, so an idle worker's first post-wake work is
+            // not stamped with the park-start time.
+            const now_ns = clock.monotonic();
+            self.now_ns = now_ns;
 
             for (self.cqes[0..reaped]) |cqe| try handler(ctx, self, Self.fromRaw(cqe));
             self.stats.cqes += reaped;
@@ -343,6 +345,8 @@ pub fn Loop(comptime Tag: type) type {
                 .posted = @intCast(posted),
                 .entered = entered,
                 .waited = waited,
+                .start_ns = start_ns,
+                .now_ns = now_ns,
             };
         }
 
