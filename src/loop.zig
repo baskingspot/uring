@@ -232,6 +232,27 @@ pub fn Loop(comptime Tag: type) type {
             comptime handler: anytype,
             wait: Wait,
         ) !Tick {
+            return self.tickStarting(ctx, null, handler, wait);
+        }
+
+        /// `tick`, with a function called once per pass after the enter and
+        /// before the first handler, receiving the pass's settled facts.
+        ///
+        /// A caller whose handlers read a cached clock needs exactly this
+        /// point: refreshing after `tick` returns is too late, because every
+        /// handler has already run on the previous pass's sample, and
+        /// refreshing before the tick is too early, because it would stamp an
+        /// idle worker's first post-wake work with the park-start time.
+        ///
+        /// `before_dispatch` is `fn (ctx: anytype, loop: *Self, done: Tick)
+        /// void`, known at comptime; pass `null` for none.
+        pub fn tickStarting(
+            self: *Self,
+            ctx: anytype,
+            comptime before_dispatch: anytype,
+            comptime handler: anytype,
+            wait: Wait,
+        ) !Tick {
             // No stop check here on purpose. The stop decision belongs to
             // whoever owns the loop's lifetime, and a tick that quietly
             // returns is a hang with no syscall to show for it. A shutdown
@@ -309,6 +330,18 @@ pub fn Loop(comptime Tag: type) type {
             const now_ns = clock.monotonic();
             self.now_ns = now_ns;
 
+            const done: Tick = .{
+                .cqes = reaped,
+                .posted = @intCast(posted),
+                .entered = entered,
+                .waited = waited,
+                .start_ns = start_ns,
+                .now_ns = now_ns,
+            };
+            if (comptime @TypeOf(before_dispatch) != @TypeOf(null)) {
+                before_dispatch(ctx, self, done);
+            }
+
             for (self.cqes[0..reaped]) |cqe| try handler(ctx, self, Self.fromRaw(cqe));
             self.stats.cqes += reaped;
 
@@ -327,14 +360,7 @@ pub fn Loop(comptime Tag: type) type {
             // line that replaces a submit call at every arm site.
             if (self.ring.sqPending() != 0) try self.ring.submit();
 
-            return .{
-                .cqes = reaped,
-                .posted = @intCast(posted),
-                .entered = entered,
-                .waited = waited,
-                .start_ns = start_ns,
-                .now_ns = now_ns,
-            };
+            return done;
         }
 
         /// `tick` until `stop`. The waiting mode is comptime, so a run that

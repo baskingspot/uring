@@ -411,3 +411,43 @@ test "provided buffers: a multishot receive fills a ring buffer" {
     group.deinit(testing.allocator);
     loop.deinit();
 }
+
+test "the pre-dispatch hook runs once, after the enter and before any handler" {
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
+    defer loop.deinit();
+
+    const Order = struct {
+        const Self = @This();
+
+        log: [4]u8 = undefined,
+        n: usize = 0,
+        hook_cqes: u32 = 0,
+
+        fn hook(self: *Self, _: *Loop(Tag), done: Loop(Tag).Tick) void {
+            self.hook_cqes = done.cqes;
+            self.log[self.n] = 'h';
+            self.n += 1;
+        }
+
+        fn on(self: *Self, _: *Loop(Tag), _: Loop(Tag).Cqe) !void {
+            self.log[self.n] = 'c';
+            self.n += 1;
+        }
+    };
+
+    // An idle pass: the hook runs even though no handler will.
+    var idle: Order = .{};
+    _ = try loop.tickStarting(&idle, Order.hook, Order.on, .no_wait);
+    try testing.expectEqualStrings("h", idle.log[0..idle.n]);
+    try testing.expectEqual(@as(u32, 0), idle.hook_cqes);
+
+    // A pass with two completions: the hook runs once, before both handlers.
+    _ = try loop.nop(.{ .op = .timer, .slot = 1, .gen = 1 });
+    _ = try loop.nop(.{ .op = .timer, .slot = 2, .gen = 1 });
+    var busy: Order = .{};
+    _ = try loop.tickStarting(&busy, Order.hook, Order.on, .no_wait);
+    try testing.expectEqualStrings("hcc", busy.log[0..busy.n]);
+    // The hook sees the batch it is about to dispatch.
+    try testing.expectEqual(@as(u32, 2), busy.hook_cqes);
+}
