@@ -302,3 +302,32 @@ test "a tick reports the facts a caller's policy needs" {
     try testing.expect(timed.waited);
     try testing.expect(timed.now_ns - timed.start_ns >= 10 * std.time.ns_per_ms);
 }
+
+test "a polling tick reaps what its own poll revealed" {
+    // DEFER_TASKRUN leaves a ready eventfd invisible until an enter. A tick
+    // that polls must copy afterwards, or the completion it just made visible
+    // waits for the next tick.
+    var ev: [1]linux.fd_t = undefined;
+    const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    ev[0] = @intCast(rc);
+    defer _ = linux.close(ev[0]);
+
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
+    defer loop.deinit();
+
+    const tag: Tag = .{ .op = .timer, .slot = 9, .gen = 1 };
+    _ = try loop.pollAdd(tag, ev[0], linux.POLL.IN);
+    try loop.ring.submit();
+    const one: u64 = 1;
+    try testing.expectEqual(@as(usize, 8), linux.write(ev[0], @ptrCast(&one), 8));
+    try testing.expectEqual(@as(u32, 0), loop.ring.cqReady());
+
+    var app: App = .{};
+    const ticked = try loop.tick(&app, App.onCompletion, .no_wait);
+    try testing.expect(ticked.entered);
+    try testing.expectEqual(@as(u32, 1), ticked.cqes);
+    try testing.expectEqual(@as(usize, 1), app.count);
+    try testing.expectEqual(@as(u16, 9), app.seen[0].slot);
+}

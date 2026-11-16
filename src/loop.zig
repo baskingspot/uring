@@ -261,13 +261,12 @@ pub fn Loop(comptime Tag: type) type {
                     },
                     .once => {
                         waited = true;
-                        const woken = self.ring.wait(1, null) catch |err| switch (err) {
+                        _ = self.ring.wait(1, null) catch |err| switch (err) {
                             // A signal is an external wakeup, not a fault:
                             // nothing was lost, and the next tick retries.
                             error.SignalInterrupt => return error.SignalInterrupt,
                             else => |e| return e,
                         };
-                        if (!woken.timed_out) reaped = try self.ring.copyCqes(self.cqes);
                     },
                     .until => |deadline_ns| {
                         const wait_ns: u64 = @intCast(@max(0, deadline_ns - start_ns));
@@ -281,14 +280,17 @@ pub fn Loop(comptime Tag: type) type {
                             };
                         } else {
                             waited = true;
-                            const woken = self.ring.wait(1, wait_ns) catch |err| switch (err) {
+                            _ = self.ring.wait(1, wait_ns) catch |err| switch (err) {
                                 error.SignalInterrupt => return error.SignalInterrupt,
                                 else => |e| return e,
                             };
-                            if (!woken.timed_out) reaped = try self.ring.copyCqes(self.cqes);
                         }
                     },
                 }
+                // The enter may have produced completions — a poll especially,
+                // which is how a deferred completion becomes visible at all
+                // under DEFER_TASKRUN. Reap them now, not next tick.
+                reaped = try self.ring.copyCqes(self.cqes);
                 now_ns = clock.monotonic();
                 self.stats.kernel_ns += now_ns - start_ns;
             }
