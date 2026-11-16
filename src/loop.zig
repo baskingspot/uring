@@ -48,8 +48,9 @@ pub fn Loop(comptime Tag: type) type {
             /// slice disables `post`.
             posted: []Tag = &.{},
             /// Flush the submission queue once this many slots are left. A
-            /// prep that finds the queue full loses the operation, so the
-            /// loop publishes early rather than at the edge.
+            /// prep that finds the queue full retries once and then fails
+            /// with `error.SubmissionQueueFull`, so the loop publishes early
+            /// rather than at the edge.
             sq_floor: u16 = 8,
         };
 
