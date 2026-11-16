@@ -23,5 +23,18 @@ All notable changes to uring are recorded here. The format follows
 - `Ring` wraps `std.os.linux.IoUring` with that enter and the submit
   discipline. `DEFER_TASKRUN | SINGLE_ISSUER` is the default mask. A kernel
   without `IORING_FEAT_EXT_ARG` is refused at `init`.
-- `bench/` compares the loop against the equivalent hand-written loop over
-  `std.os.linux.IoUring`: dispatch, idle tick, and submission prep.
+- `bench/` (testingx) compares the loop against the equivalent hand-written
+  loop over `std.os.linux.IoUring`: a dispatch batch and an idle pass.
+- The operation set is complete against `std.os.linux.IoUring`: every opcode
+  it encodes has a wrapper taking the caller's tag (`read`, `write`,
+  `readFixed`, `writeFixed`, `writev`, `splice`, `fsync`, `fallocate`,
+  `statx`, `openat`, the `at` family, `waitid`, `epollCtl`, the socket ops,
+  `sendZc`, `sendmsgZc`, `pollRemove`/`pollUpdate`, `timeoutRemove`,
+  `linkTimeout`, the `*Direct` variants, and the rest).
+- `Ring` covers registration: files (sparse, alloc-range, update,
+  unregister), buffers, eventfd (plain and async), NAPI, and `probe` with
+  `supports` for asking a kernel what it encodes.
+- Provided buffers: `BufferGroup` with `recvMultishot`, `bufferGet`, and
+  `bufferPut`. Operations `std` does not encode (`msg_ring`, futex, `tee`,
+  `madvise`, `openat2`, personalities, restrictions) are listed in the module
+  docs as not covered.

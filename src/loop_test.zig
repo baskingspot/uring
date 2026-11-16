@@ -7,6 +7,7 @@ const linux = std.os.linux;
 const testing = std.testing;
 
 const Loop = @import("loop.zig").Loop;
+const BufferGroup = @import("loop.zig").BufferGroup;
 
 /// A packed tag in handoff's shape: an operation, a slot, and a generation that
 /// makes a stale completion detectable.
@@ -357,4 +358,56 @@ test "a poll tick enters even when a completion is already visible" {
     try testing.expect(polled.entered);
     try testing.expect(!polled.waited);
     try testing.expectEqual(@as(u32, 1), polled.cqes);
+}
+
+test "provided buffers: a multishot receive fills a ring buffer" {
+    var sv: [2]linux.fd_t = undefined;
+    try testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &sv)),
+    );
+    defer for (sv) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
+    var group: BufferGroup = try .init(&loop.ring.inner, testing.allocator, 0, 64, 4);
+
+    const Capture = struct {
+        const Self = @This();
+
+        cqe: ?Loop(Tag).Cqe = null,
+
+        fn on(self: *Self, _: *Loop(Tag), cqe: Loop(Tag).Cqe) !void {
+            self.cqe = cqe;
+        }
+    };
+    var cap: Capture = .{};
+
+    _ = try loop.recvMultishot(.{ .op = .recv, .slot = 4, .gen = 1 }, &group, sv[1], 0);
+    try loop.ring.submit();
+    try testing.expectEqual(@as(usize, 6), linux.write(sv[0], "hello!", 6));
+
+    const ticked = try loop.tick(&cap, Capture.on, .once);
+    try testing.expectEqual(@as(u32, 1), ticked.cqes);
+    const cqe = cap.cqe.?;
+    try testing.expectEqual(@as(u16, 4), cqe.tag.slot);
+    try testing.expectEqual(@as(i32, 6), cqe.res);
+
+    const got = try loop.bufferGet(&group, cqe);
+    try testing.expectEqualStrings("hello!", got);
+    try loop.bufferPut(&group, cqe);
+
+    // The multishot is still armed and borrows the buffer ring: cancel it and
+    // reap the cancellation before freeing either, or the unregister lands on
+    // a closed ring.
+    const recv_tag: Tag = .{ .op = .recv, .slot = 4, .gen = 1 };
+    _ = try loop.cancel(.{ .op = .timer, .slot = 5, .gen = 1 }, recv_tag, 0);
+    _ = try loop.tick(&cap, Capture.on, .once);
+    _ = try loop.tick(&cap, Capture.on, .once);
+    try testing.expectEqual(linux.E.CANCELED, cap.cqe.?.errno());
+
+    group.deinit(testing.allocator);
+    loop.deinit();
 }

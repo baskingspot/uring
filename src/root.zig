@@ -26,6 +26,34 @@
 //! The loop never closes a descriptor, never frees a byte, and never rearms an
 //! operation. Those are the caller's calls, which is what lets one loop serve a
 //! proxy, a database, and a test.
+//!
+//! ## Coverage
+//!
+//! Every operation `std.os.linux.IoUring` encodes has a wrapper here, and the
+//! wrapper takes the caller's tag in place of a raw `user_data`: accept
+//! (single, multishot, direct), connect, bind, listen, socket (plain, direct,
+//! direct-alloc), send, sendmsg, send_zc (plain and fixed), recv, recvmsg,
+//! recv_multishot, read, read_fixed, write, writev, write_fixed, close,
+//! close_direct, fsync, fallocate, statx, splice, openat (plain and direct),
+//! renameat, unlinkat, mkdirat, symlinkat, linkat, waitid, epoll_ctl, timeout,
+//! link_timeout, timeout_remove, poll_add, poll_remove, poll_update, cancel,
+//! shutdown, nop, provide_buffers, remove_buffers, and `URING_CMD` on a socket
+//! (cmd_sock, setsockopt, getsockopt).
+//!
+//! `Ring` covers what the kernel lets a ring register: files (plain, sparse,
+//! alloc-range, update, unregister), buffers, eventfd (plain and async), NAPI,
+//! and the probe (`Ring.supports` asks it about an op).
+//!
+//! Provided buffers are `BufferGroup` plus `recvMultishot`, `bufferGet`, and
+//! `bufferPut`.
+//!
+//! Not encoded, because `std` does not encode them: `msg_ring`, `futex_wait`,
+//! `futex_wake`, `futex_waitv`, `tee`, `madvise`, `openat2`,
+//! `timeout_update`, and a generic `URING_CMD` for non-socket commands.
+//! Registration that `std` does not expose either: personalities,
+//! restrictions, `iowq` worker limits, `sync_cancel`, `clamp`, `pbuf_status`,
+//! and `files_update2`. Those need an SQE or a registration built by hand; the
+//! `sqe()` escape hatch is where that goes.
 
 pub const Loop = @import("loop.zig").Loop;
 pub const Ring = @import("Ring.zig");
@@ -34,5 +62,6 @@ test {
     _ = Ring;
     _ = Loop;
     _ = @import("loop_test.zig");
+    _ = @import("ops_test.zig");
     _ = @import("clock.zig");
 }

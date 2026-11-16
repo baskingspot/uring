@@ -14,12 +14,14 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const posix = std.posix;
 const testing = std.testing;
-const clock = @import("clock.zig");
 const mem = std.mem;
 const assert = std.debug.assert;
 pub const RecvBuffer = linux.IoUring.RecvBuffer;
 pub const ReadBuffer = linux.IoUring.ReadBuffer;
+
+const clock = @import("clock.zig");
 
 pub const Ring = @This();
 
@@ -67,7 +69,7 @@ pub const InitError = error{
 };
 
 pub fn init(entries: u16, flags: u32) !Ring {
-    var inner = try linux.IoUring.init(entries, flags);
+    var inner: linux.IoUring = try .init(entries, flags);
     errdefer inner.deinit();
     // Every wait in this library enters with IORING_ENTER_EXT_ARG. Without the
     // feature the enter fails as EINVAL, which reads as a malformed SQE and
@@ -89,6 +91,87 @@ pub fn sqPending(self: *Ring) u32 {
 /// The room left in the submission queue.
 pub fn available(self: *Ring) u32 {
     return @as(u32, self.entries) -| self.inner.sq_ready();
+}
+
+// ---- Registered resources ------------------------------------------------
+//
+// Ring-wide state, not per operation: registration has no tag and no
+// completion. Everything the kernel lets a ring register, std encodes.
+
+/// Register `fds` so operations can name them by index with
+/// `IOSQE_FIXED_FILE` instead of paying an fd-table lookup per operation.
+/// The result of assigning a file is unusable: the kernel has taken the
+/// reference, and the caller's fd must close it when it is done.
+pub fn registerFiles(self: *Ring, fds: []const linux.fd_t) !void {
+    try self.inner.register_files(fds);
+}
+
+/// Replace `fds.len` slots starting at `offset`.
+pub fn registerFilesUpdate(self: *Ring, offset: u32, fds: []const linux.fd_t) !void {
+    try self.inner.register_files_update(offset, fds);
+}
+
+/// Reserve `fd_count` slots without naming any file: the indexes can be
+/// filled later by operations that create a file (`*Direct`) or by
+/// `registerFilesUpdate`.
+pub fn registerFilesSparse(self: *Ring, fd_count: u32) !void {
+    try self.inner.register_files_sparse(fd_count);
+}
+
+/// Bind slot `offset` for `len` slots to the kernel's file-index allocator,
+/// so `IORING_FILE_INDEX_ALLOC` lands in that range.
+pub fn registerFileAllocRange(self: *Ring, offset: u32, len: u32) !void {
+    try self.inner.register_file_alloc_range(offset, len);
+}
+
+pub fn unregisterFiles(self: *Ring) !void {
+    try self.inner.unregister_files();
+}
+
+/// Register `buffers` for `readFixed`/`writeFixed`/`sendZcFixed`.
+pub fn registerBuffers(self: *Ring, buffers: []const posix.iovec) !void {
+    try self.inner.register_buffers(buffers);
+}
+
+pub fn unregisterBuffers(self: *Ring) !void {
+    try self.inner.unregister_buffers();
+}
+
+/// The ring posts a completion on `fd` (an eventfd) each time one arrives, so
+/// a thread that is not entering the ring can still be woken by it.
+pub fn registerEventfd(self: *Ring, fd: linux.fd_t) !void {
+    try self.inner.register_eventfd(fd);
+}
+
+/// As `registerEventfd`, but the wakeup happens before the CQE is posted.
+pub fn registerEventfdAsync(self: *Ring, fd: linux.fd_t) !void {
+    try self.inner.register_eventfd_async(fd);
+}
+
+pub fn unregisterEventfd(self: *Ring) !void {
+    try self.inner.unregister_eventfd();
+}
+
+/// NAPI busy polling for the given NAPI ids.
+pub fn registerNapi(self: *Ring, napi: *linux.io_uring_napi) !void {
+    try self.inner.register_napi(napi);
+}
+
+pub fn unregisterNapi(self: *Ring) !void {
+    try self.inner.unregister_napi();
+}
+
+/// What this kernel's ring supports. Ask before choosing an op or a flag if
+/// the deployment target's kernel is not known.
+pub fn probe(self: *Ring) !linux.io_uring_probe {
+    return self.inner.get_probe();
+}
+
+/// True when the ring can do `op` on this kernel.
+pub fn supports(probe_result: *const linux.io_uring_probe, op: linux.IORING_OP) bool {
+    const index = @backingInt(op);
+    if (index >= probe_result.ops.len) return false;
+    return probe_result.ops[index].flags != 0;
 }
 
 /// A blank SQE whose `user_data` is the caller's. The escape hatch: every
@@ -309,4 +392,35 @@ test "a full submission queue flushes instead of failing" {
         seen += try ring.copyCqes(&buf);
     }
     try testing.expectEqual(@as(u32, 9), seen);
+}
+
+test "registered files round-trip" {
+    var ring: Ring = try .init(8, default_flags);
+    defer ring.deinit();
+    const rc = linux.open("/dev/null", .{}, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    try ring.registerFiles(&.{fd});
+    try ring.registerFilesUpdate(0, &.{fd});
+    try ring.unregisterFiles();
+}
+
+test "registered buffers round-trip" {
+    var ring: Ring = try .init(8, default_flags);
+    defer ring.deinit();
+    var buf: [4096]u8 align(4096) = undefined;
+    const iov: posix.iovec = .{ .base = &buf, .len = buf.len };
+
+    try ring.registerBuffers(&.{iov});
+    try ring.unregisterBuffers();
+}
+
+test "the probe names what this kernel supports" {
+    var ring: Ring = try .init(8, default_flags);
+    defer ring.deinit();
+    const caps = try ring.probe();
+    try testing.expect(caps.ops.len > 0);
+    try testing.expect(supports(&caps, .NOP));
 }

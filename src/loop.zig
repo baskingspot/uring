@@ -18,6 +18,10 @@ const posix = std.posix;
 const assert = std.debug.assert;
 
 const clock = @import("clock.zig");
+
+/// The kernel's provided-buffer ring. `BufferGroup.init` takes the ring:
+/// `try uring.BufferGroup.init(&loop.ring.inner, allocator, group_id, size, count)`.
+pub const BufferGroup = linux.IoUring.BufferGroup;
 const Ring = @import("Ring.zig").Ring;
 
 pub fn Loop(comptime Tag: type) type {
@@ -488,6 +492,602 @@ pub fn Loop(comptime Tag: type) type {
         ) !*linux.io_uring_sqe {
             try self.room();
             return self.ring.inner.shutdown(Self.encode(tag), sockfd, how);
+        }
+
+        // ---- The rest of the operation set ----------------------------------
+        //
+        // One wrapper per op `std.os.linux.IoUring` encodes. Each takes the
+        // caller's tag in place of a raw user_data, publishes when the queue
+        // is near full, and returns the SQE so every flag stays the caller's.
+        //
+        // Registered files: pass the index where an fd goes and set
+        // `IOSQE_FIXED_FILE` on the returned SQE, as liburing requires. The
+        // `*Direct` variants below are the ones liburing also has: they take
+        // the destination index for a newly created file.
+
+        pub fn fsync(self: *Self, tag: Tag, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.fsync(Self.encode(tag), fd, flags);
+        }
+
+        pub fn read(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            buffer: Ring.ReadBuffer,
+            offset: u64,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.read(Self.encode(tag), fd, buffer, offset);
+        }
+
+        pub fn write(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            buffer: []const u8,
+            offset: u64,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.write(Self.encode(tag), fd, buffer, offset);
+        }
+
+        /// Both ends registered: `IOSQE_FIXED_FILE` on each, and the offsets
+        /// are ignored (io_uring splices at the file positions).
+        pub fn splice(
+            self: *Self,
+            tag: Tag,
+            fd_in: linux.fd_t,
+            off_in: u64,
+            fd_out: linux.fd_t,
+            off_out: u64,
+            len: usize,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.splice(Self.encode(tag), fd_in, off_in, fd_out, off_out, len);
+        }
+
+        /// `buffer` must have been registered with `ring.registerBuffers`, and
+        /// `buffer_index` is its index there.
+        pub fn readFixed(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            buffer: *posix.iovec,
+            offset: u64,
+            buffer_index: u16,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.read_fixed(
+                Self.encode(tag),
+                fd,
+                buffer,
+                offset,
+                buffer_index,
+            );
+        }
+
+        pub fn writev(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            iovecs: []const posix.iovec_const,
+            offset: u64,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.writev(Self.encode(tag), fd, iovecs, offset);
+        }
+
+        pub fn writeFixed(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            buffer: *posix.iovec,
+            offset: u64,
+            buffer_index: u16,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.write_fixed(
+                Self.encode(tag),
+                fd,
+                buffer,
+                offset,
+                buffer_index,
+            );
+        }
+
+        /// A single accept. `acceptMultishot` above is the one that keeps
+        /// producing completions from one SQE.
+        pub fn accept(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            addr: ?*posix.sockaddr,
+            addrlen: ?*posix.socklen_t,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.accept(Self.encode(tag), fd, addr, addrlen, flags);
+        }
+
+        /// Accept into registered file slot `file_index` (see
+        /// `ring.registerFiles`), or `IORING_FILE_INDEX_ALLOC` to let the
+        /// kernel pick.
+        pub fn acceptDirect(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            addr: ?*posix.sockaddr,
+            addrlen: ?*posix.socklen_t,
+            flags: u32,
+            file_index: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            // std's convenience pins this to IORING_FILE_INDEX_ALLOC; the
+            // kernel takes any slot the caller reserved.
+            const direct = try self.ring.inner.get_sqe();
+            direct.prep_accept_direct(fd, addr, addrlen, flags, file_index);
+            direct.user_data = Self.encode(tag);
+            return direct;
+        }
+
+        pub fn acceptMultishotDirect(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            addr: ?*posix.sockaddr,
+            addrlen: ?*posix.socklen_t,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.accept_multishot_direct(
+                Self.encode(tag),
+                fd,
+                addr,
+                addrlen,
+                flags,
+            );
+        }
+
+        pub fn epollCtl(
+            self: *Self,
+            tag: Tag,
+            epfd: linux.fd_t,
+            fd: linux.fd_t,
+            op: u32,
+            ev: ?*linux.epoll_event,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.epoll_ctl(Self.encode(tag), epfd, fd, op, ev);
+        }
+
+        /// Zerocopy send. Produces two completions: the result, then a
+        /// notification (`IORING_CQE_F_NOTIF`) that the buffer is free.
+        pub fn sendZc(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            buffer: []const u8,
+            send_flags: u32,
+            zc_flags: u16,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.send_zc(Self.encode(tag), fd, buffer, send_flags, zc_flags);
+        }
+
+        pub fn sendZcFixed(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            buffer: []const u8,
+            send_flags: u32,
+            zc_flags: u16,
+            buffer_index: u16,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.send_zc_fixed(
+                Self.encode(tag),
+                fd,
+                buffer,
+                send_flags,
+                zc_flags,
+                buffer_index,
+            );
+        }
+
+        pub fn sendmsgZc(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            msg: *const linux.msghdr_const,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.sendmsg_zc(Self.encode(tag), fd, msg, flags);
+        }
+
+        pub fn openat(
+            self: *Self,
+            tag: Tag,
+            dir_fd: linux.fd_t,
+            path: [*:0]const u8,
+            flags: linux.O,
+            mode: posix.mode_t,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.openat(Self.encode(tag), dir_fd, path, flags, mode);
+        }
+
+        /// Open into registered file slot `file_index`.
+        pub fn openatDirect(
+            self: *Self,
+            tag: Tag,
+            dir_fd: linux.fd_t,
+            path: [*:0]const u8,
+            flags: linux.O,
+            mode: posix.mode_t,
+            file_index: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.openat_direct(
+                Self.encode(tag),
+                dir_fd,
+                path,
+                flags,
+                mode,
+                file_index,
+            );
+        }
+
+        /// Close registered file slot `file_index`.
+        pub fn closeDirect(self: *Self, tag: Tag, file_index: u32) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.close_direct(Self.encode(tag), file_index);
+        }
+
+        /// Cancel a timeout armed with `timeout` by its tag.
+        pub fn timeoutRemove(
+            self: *Self,
+            tag: Tag,
+            target: Tag,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.timeout_remove(Self.encode(tag), Self.encode(target), flags);
+        }
+
+        /// A timeout linked to the SQE before it, so it fires only if that
+        /// operation has not completed.
+        pub fn linkTimeout(
+            self: *Self,
+            tag: Tag,
+            deadline: *const linux.kernel_timespec,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.link_timeout(Self.encode(tag), deadline, flags);
+        }
+
+        pub fn pollRemove(self: *Self, tag: Tag, target: Tag) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.poll_remove(Self.encode(tag), Self.encode(target));
+        }
+
+        pub fn pollUpdate(
+            self: *Self,
+            tag: Tag,
+            old: Tag,
+            new: Tag,
+            poll_mask: u32,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.poll_update(
+                Self.encode(tag),
+                Self.encode(old),
+                Self.encode(new),
+                poll_mask,
+                flags,
+            );
+        }
+
+        pub fn fallocate(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            mode: i32,
+            offset: u64,
+            len: u64,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.fallocate(Self.encode(tag), fd, mode, offset, len);
+        }
+
+        pub fn statx(
+            self: *Self,
+            tag: Tag,
+            dir_fd: linux.fd_t,
+            path: [:0]const u8,
+            flags: u32,
+            mask: linux.STATX,
+            buf: *linux.Statx,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.statx(Self.encode(tag), dir_fd, path, flags, mask, buf);
+        }
+
+        pub fn renameat(
+            self: *Self,
+            tag: Tag,
+            old_dir_fd: linux.fd_t,
+            old_path: [*:0]const u8,
+            new_dir_fd: linux.fd_t,
+            new_path: [*:0]const u8,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.renameat(
+                Self.encode(tag),
+                old_dir_fd,
+                old_path,
+                new_dir_fd,
+                new_path,
+                flags,
+            );
+        }
+
+        pub fn unlinkat(
+            self: *Self,
+            tag: Tag,
+            dir_fd: linux.fd_t,
+            path: [*:0]const u8,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.unlinkat(Self.encode(tag), dir_fd, path, flags);
+        }
+
+        pub fn mkdirat(
+            self: *Self,
+            tag: Tag,
+            dir_fd: linux.fd_t,
+            path: [*:0]const u8,
+            mode: posix.mode_t,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.mkdirat(Self.encode(tag), dir_fd, path, mode);
+        }
+
+        pub fn symlinkat(
+            self: *Self,
+            tag: Tag,
+            target: [*:0]const u8,
+            new_dir_fd: linux.fd_t,
+            link_path: [*:0]const u8,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.symlinkat(Self.encode(tag), target, new_dir_fd, link_path);
+        }
+
+        pub fn linkat(
+            self: *Self,
+            tag: Tag,
+            old_dir_fd: linux.fd_t,
+            old_path: [*:0]const u8,
+            new_dir_fd: linux.fd_t,
+            new_path: [*:0]const u8,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.linkat(
+                Self.encode(tag),
+                old_dir_fd,
+                old_path,
+                new_dir_fd,
+                new_path,
+                flags,
+            );
+        }
+
+        pub fn waitid(
+            self: *Self,
+            tag: Tag,
+            id_type: linux.P,
+            id: i32,
+            infop: *linux.siginfo_t,
+            options: u32,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.waitid(Self.encode(tag), id_type, id, infop, options, flags);
+        }
+
+        pub fn socket(
+            self: *Self,
+            tag: Tag,
+            domain: u32,
+            socket_type: u32,
+            protocol: u32,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.socket(Self.encode(tag), domain, socket_type, protocol, flags);
+        }
+
+        /// Socket into registered file slot `file_index`.
+        pub fn socketDirect(
+            self: *Self,
+            tag: Tag,
+            domain: u32,
+            socket_type: u32,
+            protocol: u32,
+            flags: u32,
+            file_index: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.socket_direct(
+                Self.encode(tag),
+                domain,
+                socket_type,
+                protocol,
+                flags,
+                file_index,
+            );
+        }
+
+        /// Socket into a slot the kernel picks (`IORING_FILE_INDEX_ALLOC`).
+        /// The completion's `res` is the index.
+        pub fn socketDirectAlloc(
+            self: *Self,
+            tag: Tag,
+            domain: u32,
+            socket_type: u32,
+            protocol: u32,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.socket_direct_alloc(
+                Self.encode(tag),
+                domain,
+                socket_type,
+                protocol,
+                flags,
+            );
+        }
+
+        pub fn bind(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            addr: *const posix.sockaddr,
+            addrlen: posix.socklen_t,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.bind(Self.encode(tag), fd, addr, addrlen, flags);
+        }
+
+        pub fn listen(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            backlog: usize,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.listen(Self.encode(tag), fd, backlog, flags);
+        }
+
+        /// `IORING_OP_URING_CMD` on a socket: the only uring_cmd std encodes.
+        pub fn cmdSock(
+            self: *Self,
+            tag: Tag,
+            cmd_op: linux.IO_URING_SOCKET_OP,
+            fd: linux.fd_t,
+            level: u32,
+            optname: u32,
+            optval: u64,
+            optlen: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.cmd_sock(
+                Self.encode(tag),
+                cmd_op,
+                fd,
+                level,
+                optname,
+                optval,
+                optlen,
+            );
+        }
+
+        pub fn setsockopt(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            level: u32,
+            optname: u32,
+            opt: []const u8,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.setsockopt(Self.encode(tag), fd, level, optname, opt);
+        }
+
+        pub fn getsockopt(
+            self: *Self,
+            tag: Tag,
+            fd: linux.fd_t,
+            level: u32,
+            optname: u32,
+            opt: []u8,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.getsockopt(Self.encode(tag), fd, level, optname, opt);
+        }
+
+        /// Multishot receive over a provided-buffer group: one SQE, one
+        /// `IORING_CQE_F_BUFFER` completion per buffer the kernel fills, until
+        /// the operation ends. Return the buffer with `bufferPut`.
+        pub fn recvMultishot(
+            self: *Self,
+            tag: Tag,
+            group: *BufferGroup,
+            fd: linux.fd_t,
+            flags: u32,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return group.recv_multishot(Self.encode(tag), fd, flags);
+        }
+
+        /// The bytes a provided-buffer completion filled, by its buffer id.
+        pub fn bufferGet(_: *Self, group: *BufferGroup, cqe: Cqe) ![]u8 {
+            const id = cqe.bufferId() orelse return error.NoBufferSelected;
+            return group.get_by_id(id)[0..@intCast(cqe.res)];
+        }
+
+        /// Give the buffer back to the kernel. Incremental consumption
+        /// (`IORING_CQE_F_BUF_MORE`) is handled by the ring: the kernel keeps
+        /// writing at the same offset until the buffer is whole.
+        pub fn bufferPut(_: *Self, group: *BufferGroup, cqe: Cqe) !void {
+            try group.put(.{
+                .user_data = 0,
+                .res = cqe.res,
+                .flags = cqe.flags,
+            });
+        }
+
+        /// Give a buffer group to the kernel the old way, one
+        /// `IORING_OP_PROVIDE_BUFFERS` per call. `BufferGroup` uses the
+        /// registered ring instead; this exists for the op itself.
+        pub fn provideBuffers(
+            self: *Self,
+            tag: Tag,
+            buffers: [*]u8,
+            buffer_size: usize,
+            buffers_count: usize,
+            group_id: usize,
+            buffer_id: usize,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.provide_buffers(
+                Self.encode(tag),
+                buffers,
+                buffer_size,
+                buffers_count,
+                group_id,
+                buffer_id,
+            );
+        }
+
+        /// Take back buffers provided with `provideBuffers`.
+        pub fn removeBuffers(
+            self: *Self,
+            tag: Tag,
+            buffers_count: usize,
+            group_id: usize,
+        ) !*linux.io_uring_sqe {
+            try self.room();
+            return self.ring.inner.remove_buffers(Self.encode(tag), buffers_count, group_id);
         }
 
         /// Publish the submission queue before it fills. A prep that finds it
