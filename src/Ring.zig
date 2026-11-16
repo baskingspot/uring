@@ -124,8 +124,15 @@ pub fn submit(self: *Ring) !void {
 /// Run the completions the kernel deferred without waiting for one. Under
 /// DEFER_TASKRUN these run only inside an enter, so an empty completion queue
 /// is not proof that there is no work.
+///
+/// A signal cannot interrupt anything here: the enter asks for no completion
+/// and waits for nothing, so `SignalInterrupt` is absorbed rather than handed
+/// to every caller. `wait` still reports it.
 pub fn poll(self: *Ring) EnterError!void {
-    _ = try self.enter(true, 0, null);
+    _ = self.enter(true, 0, null) catch |err| switch (err) {
+        error.SignalInterrupt => return,
+        else => |e| return e,
+    };
 }
 
 /// Block until `min_complete` completions arrive, the deadline passes, or a

@@ -63,19 +63,19 @@ pub fn Loop(comptime Tag: type) type {
             /// The errno in `res`, or `.SUCCESS`. An io_uring result uses the
             /// syscall convention, so this is the std decoder and not a
             /// second copy of it.
-            pub fn errno(self: *const Cqe) linux.E {
+            pub inline fn errno(self: *const Cqe) linux.E {
                 return linux.errno(self.res);
             }
 
             /// The operation that produced this completion is still armed and
             /// will produce more: a multishot accept or receive.
-            pub fn more(self: Cqe) bool {
+            pub inline fn more(self: *const Cqe) bool {
                 return self.flags & linux.IORING_CQE_F_MORE != 0;
             }
 
             /// The selected buffer group's id, for a receive that used buffer
             /// selection.
-            pub fn bufferId(self: Cqe) ?u16 {
+            pub inline fn bufferId(self: *const Cqe) ?u16 {
                 if (self.flags & linux.IORING_CQE_F_BUFFER == 0) return null;
                 return @intCast(self.flags >> linux.IORING_CQE_BUFFER_SHIFT);
             }
@@ -257,10 +257,7 @@ pub fn Loop(comptime Tag: type) type {
                 // The caller asked for an enter regardless of what is ready.
                 .poll => {
                     entered = true;
-                    self.ring.poll() catch |err| switch (err) {
-                        error.SignalInterrupt => {},
-                        else => |e| return e,
-                    };
+                    try self.ring.poll();
                     reaped = try self.ring.copyCqes(self.cqes);
                 },
                 .no_wait, .once, .until => {
@@ -273,20 +270,11 @@ pub fn Loop(comptime Tag: type) type {
                                 // Still an enter: under DEFER_TASKRUN, an
                                 // empty completion queue is not proof that
                                 // there is no work.
-                                self.ring.poll() catch |err| switch (err) {
-                                    error.SignalInterrupt => {},
-                                    else => |e| return e,
-                                };
+                                try self.ring.poll();
                             },
                             .once => {
                                 waited = true;
-                                _ = self.ring.wait(1, null) catch |err| switch (err) {
-                                    // A signal is an external wakeup, not a
-                                    // fault: nothing was lost, and the next
-                                    // tick retries.
-                                    error.SignalInterrupt => return error.SignalInterrupt,
-                                    else => |e| return e,
-                                };
+                                _ = try self.ring.wait(1, null);
                             },
                             .until => |deadline_ns| {
                                 const remaining = deadline_ns - clock.monotonic();
@@ -295,16 +283,10 @@ pub fn Loop(comptime Tag: type) type {
                                     // The deadline already passed. Poll, which
                                     // is the same enter without a wait for a
                                     // completion that cannot arrive first.
-                                    self.ring.poll() catch |err| switch (err) {
-                                        error.SignalInterrupt => {},
-                                        else => |e| return e,
-                                    };
+                                    try self.ring.poll();
                                 } else {
                                     waited = true;
-                                    _ = self.ring.wait(1, wait_ns) catch |err| switch (err) {
-                                        error.SignalInterrupt => return error.SignalInterrupt,
-                                        else => |e| return e,
-                                    };
+                                    _ = try self.ring.wait(1, wait_ns);
                                 }
                             },
                         }
