@@ -85,7 +85,7 @@ test "every wrapper arms its own opcode with the caller's tag" {
 
     // The send/receive family that predates this file.
     try expectOp(.NOP, try loop.nop(tag));
-    try expectOp(.RECV, try loop.recv(tag, 0, .{ .buffer = undefined }, 0));
+    try expectOp(.RECV, try loop.recv(tag, 0, .{ .buffer = &read_buf }, 0));
     try expectOp(.SEND, try loop.send(tag, 0, "x", 0));
     try expectOp(.RECVMSG, try loop.recvmsg(tag, 0, @constCast(&msg), 0));
     try expectOp(.SENDMSG, try loop.sendmsg(tag, 0, &msg_const, 0));
