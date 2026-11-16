@@ -10,6 +10,11 @@ default:
 test:
     zig build test --summary all
 
+[doc("Compare the loop against the hand-written loop. `just bench` runs every case; `just bench dispatch loop` runs one side of one case, for perf")]
+[group("test")]
+bench *ARGS:
+    zig build bench -Doptimize=ReleaseFast -- {{ ARGS }}
+
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:
