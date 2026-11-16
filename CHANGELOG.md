@@ -21,8 +21,10 @@ All notable changes to uring are recorded here. The format follows
   that measures an idle gap does not have to. `Loop.now` is that tick's
   sample.
 - `Ring` wraps `std.os.linux.IoUring` with that enter and the submit
-  discipline. `DEFER_TASKRUN | SINGLE_ISSUER` is the default mask. A kernel
-  without `IORING_FEAT_EXT_ARG` is refused at `init`.
+  discipline. Ring setup is `Ring.Setup`, a struct of named bits with the
+  values that ride beside them (`cq_entries`, `sq_thread_cpu`,
+  `sq_thread_idle`, `wq_fd`); the default is deferred completions with a
+  single issuer. A kernel without `IORING_FEAT_EXT_ARG` is refused at `init`.
 - `bench/` (testingx) compares the loop against the equivalent hand-written
   loop over `std.os.linux.IoUring`: a dispatch batch and an idle pass.
 - The operation set is complete against `std.os.linux.IoUring`: every opcode

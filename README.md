@@ -22,7 +22,11 @@ const uring = @import("uring");
 const Tag = packed struct(u64) { op: u8, slot: u16, gen: u16, spare: u24 };
 
 var cqes: [64]std.os.linux.io_uring_cqe = undefined;
-var loop: uring.Loop(Tag) = try .init(.{ .cqes = &cqes });
+var loop: uring.Loop(Tag) = try .init(.{
+    .cqes = &cqes,
+    // Ring setup is named bits and their values, not a flag word.
+    .setup = .{ .single_issuer = true, .defer_taskrun = true },
+});
 defer loop.deinit();
 
 _ = try loop.recv(.{ .op = 1, .slot = 7, .gen = 1 }, fd, .{ .buffer = buf }, 0);

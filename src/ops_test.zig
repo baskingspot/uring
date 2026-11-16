@@ -20,6 +20,8 @@ const tag: Tag = .{ .op = 3, .slot = 7, .gen = 9 };
 
 /// The fixed-buffer wrappers take a mutable iovec, which nothing here writes.
 var scratch_iov: posix.iovec = .{ .base = undefined, .len = 0 };
+/// `getsockopt` needs a real destination slice: std reads its length.
+var scratch_opt: [8]u8 = undefined;
 
 fn expectOp(want: linux.IORING_OP, sqe: *linux.io_uring_sqe) !void {
     try testing.expectEqual(want, sqe.opcode);
@@ -77,7 +79,7 @@ test "every wrapper arms its own opcode with the caller's tag" {
     try expectOp(.LISTEN, try loop.listen(tag, 0, 128, 0));
     try expectOp(.URING_CMD, try loop.cmdSock(tag, .SETSOCKOPT, 0, 0, 0, 0, 0));
     try expectOp(.URING_CMD, try loop.setsockopt(tag, 0, 0, 0, "x"));
-    try expectOp(.URING_CMD, try loop.getsockopt(tag, 0, 0, 0, undefined));
+    try expectOp(.URING_CMD, try loop.getsockopt(tag, 0, 0, 0, &scratch_opt));
     try expectOp(.PROVIDE_BUFFERS, try loop.provideBuffers(tag, undefined, 0, 1, 0, 0));
     try expectOp(.REMOVE_BUFFERS, try loop.removeBuffers(tag, 1, 0));
 

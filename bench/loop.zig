@@ -81,7 +81,7 @@ fn batchLoop(b: *testingx.B) !void {
 fn batchRaw(b: *testingx.B) !void {
     const cqes = try b.internal_allocator.alloc(linux.io_uring_cqe, batch);
     defer b.internal_allocator.free(cqes);
-    var ring = try linux.IoUring.init(512, uring.Ring.default_flags);
+    var ring = try linux.IoUring.init(512, uring.Ring.default_setup.flags());
     defer ring.deinit();
 
     while (try b.loop()) {
@@ -109,7 +109,7 @@ fn idleLoop(b: *testingx.B) !void {
 fn idleRaw(b: *testingx.B) !void {
     const cqes = try b.internal_allocator.alloc(linux.io_uring_cqe, 16);
     defer b.internal_allocator.free(cqes);
-    var ring = try linux.IoUring.init(16, uring.Ring.default_flags);
+    var ring = try linux.IoUring.init(16, uring.Ring.default_setup.flags());
     defer ring.deinit();
 
     while (try b.loop()) {

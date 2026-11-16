@@ -25,12 +25,131 @@ const clock = @import("clock.zig");
 
 pub const Ring = @This();
 
-/// Deferred completions run inside the submit-side enter instead of arriving
-/// as interrupts, which is the pair this loop was measured with. The kernel
-/// requires SINGLE_ISSUER alongside DEFER_TASKRUN. Pass `flags` to `init` to
-/// ask for another mask; an unsupported one fails at ring setup.
-pub const default_flags: u32 = linux.IORING_SETUP_DEFER_TASKRUN |
-    linux.IORING_SETUP_SINGLE_ISSUER;
+/// Ring setup, in place of the raw `io_uring_setup` flag word.
+///
+/// The kernel's flags are a bitmask of unrelated booleans plus three values
+/// that are meaningless without their bit, so a `u32` lets a caller pass
+/// `IORING_SETUP_SQ_AFF` without a CPU or `CQSIZE` without a size. Here each
+/// bit has a name and the values sit beside it.
+pub const Setup = struct {
+    /// Complete each operation by polling the device: O_DIRECT block and
+    /// char devices, not sockets or pipes.
+    iopoll: bool = false,
+    /// A kernel thread submits SQEs. The ring must then be shared only for
+    /// completion reads; submitting from userspace races it.
+    sqpoll: bool = false,
+    /// Pin the SQPOLL thread to `sq_thread_cpu`.
+    sq_aff: bool = false,
+    /// Let the kernel clamp `entries` to what it can allocate instead of
+    /// failing the setup.
+    clamp: bool = false,
+    /// Start disabled: `Ring.enable` turns it on later, which lets a process
+    /// set up a ring before it has the privileges to submit.
+    r_disabled: bool = false,
+    /// Submit every SQE in the batch even after one fails, instead of
+    /// stopping at the first error.
+    submit_all: bool = false,
+    /// Deferred completions run in the submitting task. Cheaper than the
+    /// default task work, and it cannot be combined with a ring shared across
+    /// threads.
+    coop_taskrun: bool = false,
+    /// Set `IORING_SQ_TASKRUN` on the SQ ring when task work is pending.
+    taskrun_flag: bool = false,
+    /// 128-byte SQEs, for operations that carry more than 64 bytes.
+    sqe128: bool = false,
+    /// 32-byte CQEs, for the flags of CQE32 operations.
+    cqe32: bool = false,
+    /// One thread may submit. Required by `defer_taskrun`.
+    single_issuer: bool = false,
+    /// Deferred completions run only inside the submit-side enter, so the
+    /// completions cannot arrive as interrupts. Requires `single_issuer`.
+    defer_taskrun: bool = false,
+    /// The ring's memory is not mmap'd by the kernel; the caller maps it.
+    no_mmap: bool = false,
+    /// Only registered files may be used.
+    registered_fd_only: bool = false,
+    /// The SQ array (the indirection from submission order to SQE slots) is
+    /// not allocated; SQEs are consumed in order.
+    no_sqarray: bool = false,
+
+    /// `CQSIZE`: completion queue entries, when they must differ from the
+    /// submission queue's. Zero keeps the kernel's default.
+    cq_entries: u32 = 0,
+    /// `SQ_AFF`: the CPU for the SQPOLL thread.
+    sq_thread_cpu: u32 = 0,
+    /// `SQPOLL`: how long the thread idles before sleeping, in milliseconds.
+    sq_thread_idle: u32 = 1000,
+    /// `ATTACH_WQ`: share the io-wq worker pool of an existing ring.
+    wq_fd: ?linux.fd_t = null,
+
+    /// Each boolean and the kernel bit it stands for.
+    const bits = .{
+        .{ "iopoll", linux.IORING_SETUP_IOPOLL },
+        .{ "sqpoll", linux.IORING_SETUP_SQPOLL },
+        .{ "sq_aff", linux.IORING_SETUP_SQ_AFF },
+        .{ "clamp", linux.IORING_SETUP_CLAMP },
+        .{ "r_disabled", linux.IORING_SETUP_R_DISABLED },
+        .{ "submit_all", linux.IORING_SETUP_SUBMIT_ALL },
+        .{ "coop_taskrun", linux.IORING_SETUP_COOP_TASKRUN },
+        .{ "taskrun_flag", linux.IORING_SETUP_TASKRUN_FLAG },
+        .{ "sqe128", linux.IORING_SETUP_SQE128 },
+        .{ "cqe32", linux.IORING_SETUP_CQE32 },
+        .{ "single_issuer", linux.IORING_SETUP_SINGLE_ISSUER },
+        .{ "defer_taskrun", linux.IORING_SETUP_DEFER_TASKRUN },
+        .{ "no_mmap", linux.IORING_SETUP_NO_MMAP },
+        .{ "registered_fd_only", linux.IORING_SETUP_REGISTERED_FD_ONLY },
+        .{ "no_sqarray", linux.IORING_SETUP_NO_SQARRAY },
+    };
+
+    /// The flag word `io_uring_setup` wants, with `CQSIZE` and `ATTACH_WQ`
+    /// derived from the values beside them.
+    pub fn flags(self: Setup) u32 {
+        var out: u32 = 0;
+        inline for (bits) |b| {
+            if (@field(self, b[0])) out |= b[1];
+        }
+        if (self.cq_entries != 0) out |= linux.IORING_SETUP_CQSIZE;
+        if (self.wq_fd != null) out |= linux.IORING_SETUP_ATTACH_WQ;
+        return out;
+    }
+
+    /// The bits of a flag word, for a caller that has one.
+    ///
+    /// Lossy on purpose: `CQSIZE` and `ATTACH_WQ` exist only to say that a
+    /// value is present, and a word does not carry the value. Those two bits
+    /// come back false here, because a `Setup` with the bit and no value is
+    /// not expressible. Set `cq_entries` or `wq_fd` to restore them.
+    pub fn fromFlags(word: u32) Setup {
+        var out: Setup = .{};
+        inline for (bits) |b| {
+            @field(out, b[0]) = word & b[1] != 0;
+        }
+        return out;
+    }
+
+    fn params(self: Setup) linux.io_uring_params {
+        // The kernel refuses this pair in the other direction, so it is a
+        // caller error worth naming here.
+        assert(!self.defer_taskrun or self.single_issuer);
+        assert(self.sq_aff or self.sq_thread_cpu == 0);
+        var p = mem.zeroInit(linux.io_uring_params, .{
+            .flags = self.flags(),
+            .sq_thread_cpu = self.sq_thread_cpu,
+            .sq_thread_idle = self.sq_thread_idle,
+        });
+        p.cq_entries = self.cq_entries;
+        p.wq_fd = if (self.wq_fd) |fd| @intCast(fd) else 0;
+        return p;
+    }
+};
+
+/// What this loop wants by default: completions deferred to the submit-side
+/// enter, one issuer. The kernel requires the pair, and it is the
+/// configuration the loop's timings were measured with.
+pub const default_setup: Setup = .{
+    .single_issuer = true,
+    .defer_taskrun = true,
+};
 
 inner: linux.IoUring,
 entries: u16,
@@ -68,8 +187,9 @@ pub const InitError = error{
     KernelTooOld,
 };
 
-pub fn init(entries: u16, flags: u32) !Ring {
-    var inner: linux.IoUring = try .init(entries, flags);
+pub fn init(entries: u16, setup: Setup) !Ring {
+    var params = setup.params();
+    var inner: linux.IoUring = try .init_params(entries, &params);
     errdefer inner.deinit();
     // Every wait in this library enters with IORING_ENTER_EXT_ARG. Without the
     // feature the enter fails as EINVAL, which reads as a malformed SQE and
@@ -307,13 +427,13 @@ pub fn cqReady(self: *Ring) u32 {
 }
 
 test "a ring with the default mask opens, reports its depth, and closes" {
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
     try testing.expectEqual(@as(u32, 8), ring.available());
 }
 
 test "a prepped SQE is one submit away and its user_data survives" {
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
 
     _ = try ring.sqe(0xDEAD_BEEF);
@@ -332,7 +452,7 @@ test "the enter deadline ends the wait with nothing in flight" {
     // The claim this library exists for: a timeout with no SQE submitted for
     // it. Nothing is queued and nothing is armed, so only the extended
     // argument can end this wait.
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
 
     const started = clock.monotonic();
@@ -348,7 +468,7 @@ test "the enter deadline ends the wait with nothing in flight" {
 }
 
 test "a deadline does not eat a completion that arrives first" {
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
 
     _ = try ring.sqe(7);
@@ -365,7 +485,7 @@ test "a deadline does not eat a completion that arrives first" {
 }
 
 test "poll runs deferred completions without waiting" {
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
 
     try ring.poll();
@@ -377,7 +497,7 @@ test "poll runs deferred completions without waiting" {
 test "a full submission queue flushes instead of failing" {
     // Depth 8, nine preps, no submit between them. The ninth asks for room the
     // queue does not have, and gets it by publishing what is already there.
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
 
     var i: u64 = 0;
@@ -395,7 +515,7 @@ test "a full submission queue flushes instead of failing" {
 }
 
 test "registered files round-trip" {
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
     const rc = linux.open("/dev/null", .{}, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
@@ -408,7 +528,7 @@ test "registered files round-trip" {
 }
 
 test "registered buffers round-trip" {
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
     var buf: [4096]u8 align(4096) = undefined;
     const iov: posix.iovec = .{ .base = &buf, .len = buf.len };
@@ -418,9 +538,45 @@ test "registered buffers round-trip" {
 }
 
 test "the probe names what this kernel supports" {
-    var ring: Ring = try .init(8, default_flags);
+    var ring: Ring = try .init(8, default_setup);
     defer ring.deinit();
     const caps = try ring.probe();
     try testing.expect(caps.ops.len > 0);
     try testing.expect(supports(&caps, .NOP));
+}
+
+test "setup is a struct of named bits, not a flag word" {
+    // The default is the measured pair, and it survives a round trip through
+    // the raw word.
+    try testing.expectEqual(
+        linux.IORING_SETUP_DEFER_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
+        default_setup.flags(),
+    );
+    try testing.expectEqual(default_setup, Setup.fromFlags(default_setup.flags()));
+
+    // Values imply their bits: CQSIZE without a size would be a caller bug
+    // that the struct cannot express.
+    const sized: Setup = .{ .cq_entries = 512, .sqpoll = true, .sq_aff = true, .sq_thread_cpu = 3 };
+    try testing.expect(sized.flags() & linux.IORING_SETUP_CQSIZE != 0);
+    try testing.expect(sized.flags() & linux.IORING_SETUP_SQPOLL != 0);
+    try testing.expect(sized.flags() & linux.IORING_SETUP_ATTACH_WQ == 0);
+    // A word cannot carry the sizes beside a bit, so those two bits come
+    // back clear rather than claiming a value the caller does not have.
+    const recovered = Setup.fromFlags(sized.flags());
+    try testing.expectEqual(@as(u32, 0), recovered.cq_entries);
+    try testing.expectEqual(
+        linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SQ_AFF,
+        recovered.flags(),
+    );
+
+    const attached: Setup = .{ .wq_fd = 7 };
+    try testing.expect(attached.flags() & linux.IORING_SETUP_ATTACH_WQ != 0);
+    try testing.expect(Setup.fromFlags(attached.flags()).wq_fd == null);
+}
+
+test "a ring opens from a Setup, including values that ride beside a bit" {
+    // CQSIZE changes the completion queue's depth, so the ring reports it.
+    var ring: Ring = try .init(64, .{ .cq_entries = 128 });
+    defer ring.deinit();
+    try testing.expectEqual(@as(u32, 64), ring.available());
 }

@@ -37,9 +37,9 @@ pub fn Loop(comptime Tag: type) type {
         pub const Options = struct {
             /// Submission queue depth. Must be a power of two.
             entries: u16 = 256,
-            /// The io_uring setup mask. The default is DEFER_TASKRUN with
-            /// SINGLE_ISSUER; an unsupported mask fails at `init`.
-            flags: u32 = Ring.default_flags,
+            /// Ring setup. The default is deferred completions with a single
+            /// issuer; a mask the kernel refuses fails at `init`.
+            setup: Ring.Setup = Ring.default_setup,
             /// Where completions land before dispatch. Sized by the caller:
             /// the loop allocates nothing and holds nothing back. Bigger
             /// batches mean fewer enters and more work per tick.
@@ -130,7 +130,7 @@ pub fn Loop(comptime Tag: type) type {
             if (options.cqes.len == 0) return error.NoCompletionBatch;
             if (options.sq_floor == 0) return error.NoSubmissionFloor;
             return .{
-                .ring = try .init(options.entries, options.flags),
+                .ring = try .init(options.entries, options.setup),
                 .cqes = options.cqes,
                 .posted = options.posted,
                 .sq_floor = options.sq_floor,
