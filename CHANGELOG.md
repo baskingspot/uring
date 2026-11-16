@@ -5,6 +5,8 @@ All notable changes to uring are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-16
+
 ### Added
 
 - `Loop(Tag).tick`, `run`, `post`, `stop`, and the operation wrappers
