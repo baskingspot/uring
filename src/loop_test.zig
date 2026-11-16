@@ -331,3 +331,30 @@ test "a polling tick reaps what its own poll revealed" {
     try testing.expectEqual(@as(usize, 1), app.count);
     try testing.expectEqual(@as(u16, 9), app.seen[0].slot);
 }
+
+test "a poll tick enters even when a completion is already visible" {
+    // The case that made this mode exist: a caller whose queue never empties,
+    // with kernel-deferred work waiting behind it. `.no_wait` would copy the
+    // visible completion and never enter; `.poll` enters anyway.
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
+    defer loop.deinit();
+
+    _ = try loop.nop(.{ .op = .timer, .slot = 1, .gen = 1 });
+    try loop.ring.submit();
+    try testing.expectEqual(@as(u32, 1), loop.ring.cqReady());
+
+    var app: App = .{};
+    // The visible completion is reaped either way; the difference is the
+    // enter, which is what runs the kernel's deferred work.
+    const plain = try loop.tick(&app, App.onCompletion, .no_wait);
+    try testing.expect(!plain.entered);
+    try testing.expectEqual(@as(u32, 1), plain.cqes);
+
+    _ = try loop.nop(.{ .op = .timer, .slot = 2, .gen = 1 });
+    try loop.ring.submit();
+    const polled = try loop.tick(&app, App.onCompletion, .poll);
+    try testing.expect(polled.entered);
+    try testing.expect(!polled.waited);
+    try testing.expectEqual(@as(u32, 1), polled.cqes);
+}

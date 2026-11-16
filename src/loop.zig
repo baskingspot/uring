@@ -83,7 +83,13 @@ pub fn Loop(comptime Tag: type) type {
 
         /// How long one tick may spend waiting for work.
         pub const Wait = union(enum) {
-            /// Copy what is ready and return. Never blocks.
+            /// Enter on every pass, even when completions are already visible,
+            /// and never wait. Under DEFER_TASKRUN only an enter runs the
+            /// kernel's deferred completions, so a caller whose completion
+            /// queue never empties needs this or starves them.
+            poll,
+            /// Copy what is ready, enter only when nothing is, and never
+            /// block. The cheap pass for a caller with no such starvation.
             no_wait,
             /// Block until a completion arrives.
             once,
@@ -243,56 +249,76 @@ pub fn Loop(comptime Tag: type) type {
             // already published, so it costs no syscall.
             if (self.ring.sqPending() != 0) try self.ring.submit();
 
-            var reaped: u32 = try self.ring.copyCqes(self.cqes);
+            var reaped: u32 = undefined;
             var entered = false;
             var waited = false;
             var now_ns = start_ns;
 
-            if (reaped == 0 and posted == 0) {
-                entered = true;
-                switch (wait) {
-                    .no_wait => {
-                        // Still an enter: under DEFER_TASKRUN, an empty
-                        // completion queue is not proof that there is no work.
-                        self.ring.poll() catch |err| switch (err) {
-                            error.SignalInterrupt => {},
-                            else => |e| return e,
-                        };
-                    },
-                    .once => {
-                        waited = true;
-                        _ = self.ring.wait(1, null) catch |err| switch (err) {
-                            // A signal is an external wakeup, not a fault:
-                            // nothing was lost, and the next tick retries.
-                            error.SignalInterrupt => return error.SignalInterrupt,
-                            else => |e| return e,
-                        };
-                    },
-                    .until => |deadline_ns| {
-                        const wait_ns: u64 = @intCast(@max(0, deadline_ns - start_ns));
-                        if (wait_ns == 0) {
-                            // The deadline already passed. Poll, which is the
-                            // same enter without a wait for a completion that
-                            // cannot arrive before it.
-                            self.ring.poll() catch |err| switch (err) {
-                                error.SignalInterrupt => {},
-                                else => |e| return e,
-                            };
-                        } else {
-                            waited = true;
-                            _ = self.ring.wait(1, wait_ns) catch |err| switch (err) {
-                                error.SignalInterrupt => return error.SignalInterrupt,
-                                else => |e| return e,
-                            };
+            switch (wait) {
+                // The caller asked for an enter regardless of what is ready.
+                .poll => {
+                    entered = true;
+                    self.ring.poll() catch |err| switch (err) {
+                        error.SignalInterrupt => {},
+                        else => |e| return e,
+                    };
+                    reaped = try self.ring.copyCqes(self.cqes);
+                    now_ns = clock.monotonic();
+                    self.stats.kernel_ns += now_ns - start_ns;
+                },
+                .no_wait, .once, .until => {
+                    reaped = try self.ring.copyCqes(self.cqes);
+                    if (reaped == 0 and posted == 0) {
+                        entered = true;
+                        switch (wait) {
+                            .poll => unreachable,
+                            .no_wait => {
+                                // Still an enter: under DEFER_TASKRUN, an
+                                // empty completion queue is not proof that
+                                // there is no work.
+                                self.ring.poll() catch |err| switch (err) {
+                                    error.SignalInterrupt => {},
+                                    else => |e| return e,
+                                };
+                            },
+                            .once => {
+                                waited = true;
+                                _ = self.ring.wait(1, null) catch |err| switch (err) {
+                                    // A signal is an external wakeup, not a
+                                    // fault: nothing was lost, and the next
+                                    // tick retries.
+                                    error.SignalInterrupt => return error.SignalInterrupt,
+                                    else => |e| return e,
+                                };
+                            },
+                            .until => |deadline_ns| {
+                                const wait_ns: u64 = @intCast(@max(0, deadline_ns - start_ns));
+                                if (wait_ns == 0) {
+                                    // The deadline already passed. Poll, which
+                                    // is the same enter without a wait for a
+                                    // completion that cannot arrive first.
+                                    self.ring.poll() catch |err| switch (err) {
+                                        error.SignalInterrupt => {},
+                                        else => |e| return e,
+                                    };
+                                } else {
+                                    waited = true;
+                                    _ = self.ring.wait(1, wait_ns) catch |err| switch (err) {
+                                        error.SignalInterrupt => return error.SignalInterrupt,
+                                        else => |e| return e,
+                                    };
+                                }
+                            },
                         }
-                    },
-                }
-                // The enter may have produced completions — a poll especially,
-                // which is how a deferred completion becomes visible at all
-                // under DEFER_TASKRUN. Reap them now, not next tick.
-                reaped = try self.ring.copyCqes(self.cqes);
-                now_ns = clock.monotonic();
-                self.stats.kernel_ns += now_ns - start_ns;
+                        // The enter may have produced completions — a poll
+                        // especially, which is how a deferred completion
+                        // becomes visible at all under DEFER_TASKRUN. Reap
+                        // them now, not next tick.
+                        reaped = try self.ring.copyCqes(self.cqes);
+                        now_ns = clock.monotonic();
+                        self.stats.kernel_ns += now_ns - start_ns;
+                    }
+                },
             }
             self.now_ns = now_ns;
 
