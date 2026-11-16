@@ -34,6 +34,7 @@ fmt:
     oxfmt README.md AGENTS.md .github
     just --fmt
 
+[doc("Build the guide and the API reference into zig-out/site")]
 [group("docs")]
 doc: api
     baskingspot-docs build uring
