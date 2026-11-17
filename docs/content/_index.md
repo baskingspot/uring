@@ -141,6 +141,12 @@ caller parks work that the kernel did not produce, and it is bounded: the queue
 is a slice you pass as `Options.deferred`, and a full queue returns
 `error.DeferredFull` rather than dropping the tag.
 
+`stopDeferred()` ends this pass's deferred dispatch and leaves the rest of the
+queue in place, in arrival order, for the next pass. A handler that cannot take
+more deferred work this pass calls it instead of queuing the remainder again:
+queuing moves those tags behind whatever arrived during the pass, and under a
+steady arrival rate they never reach the head.
+
 `stop()` asks the loop to finish and `run` honors it between passes.
 `now()` is the tick's sample.
 
