@@ -122,6 +122,7 @@ pub fn Loop(comptime Tag: type) type {
         deferred: []Tag,
         deferred_head: usize = 0,
         deferred_len: usize = 0,
+        deferred_stopped: bool = false,
         sq_floor: u16,
         now_ns: i64 = 0,
         stopped: bool = false,
@@ -206,6 +207,16 @@ pub fn Loop(comptime Tag: type) type {
             const tail = (self.deferred_head + self.deferred_len) % self.deferred.len;
             self.deferred[tail] = tag;
             self.deferred_len += 1;
+        }
+
+        /// End this pass's deferred dispatch, leaving the rest of the queue in
+        /// place and in order. A handler that cannot take any more deferred
+        /// work this pass calls this instead of deferring the remainder again:
+        /// deferring moves them behind whatever arrived during the pass, which
+        /// starves them under a steady arrival rate. The next pass resumes at
+        /// the same head.
+        pub fn stopDeferred(self: *Self) void {
+            self.deferred_stopped = true;
         }
 
         /// One tick: wait, reap, dispatch, defer, submit.
@@ -354,14 +365,18 @@ pub fn Loop(comptime Tag: type) type {
             for (self.cqes[0..reaped]) |cqe| try handler(ctx, self, Self.fromRaw(cqe));
             self.stats.cqes += reaped;
 
+            // The snapshot bounds the pass. A handler may end it early with
+            // `stopDeferred`, which leaves the remaining tags at the head, in
+            // arrival order, for the next pass.
             var n = deferred;
-            while (n > 0) : (n -= 1) {
+            while (n > 0 and !self.deferred_stopped) : (n -= 1) {
                 const tag = self.deferred[self.deferred_head];
                 self.deferred_head = (self.deferred_head + 1) % self.deferred.len;
                 self.deferred_len -= 1;
                 self.stats.deferred += 1;
                 try handler(ctx, self, .{ .tag = tag, .res = 0, .flags = 0, .deferred = true });
             }
+            self.deferred_stopped = false;
 
             self.stats.ticks += 1;
 

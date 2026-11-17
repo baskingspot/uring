@@ -451,3 +451,60 @@ test "the pre-dispatch hook runs once, after the enter and before any handler" {
     // The hook sees the batch it is about to dispatch.
     try testing.expectEqual(@as(u32, 2), busy.hook_cqes);
 }
+
+test "stopDeferred keeps the rest of the queue in arrival order" {
+    // The starvation this exists to prevent: a handler that cannot take more
+    // deferred work this pass must leave the remainder at the head, or it
+    // lands behind whatever arrives during the pass and never runs.
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var deferred: [8]Tag = undefined;
+    var loop: Loop(Tag) = try .init(.{
+        .entries = 8,
+        .cqes = &cqes,
+        .deferred = &deferred,
+    });
+    defer loop.deinit();
+
+    const a: Tag = .{ .op = .send, .slot = 1, .gen = 1 };
+    const b: Tag = .{ .op = .send, .slot = 2, .gen = 1 };
+    const c: Tag = .{ .op = .send, .slot = 3, .gen = 1 };
+    const arrival: Tag = .{ .op = .recv, .slot = 9, .gen = 1 };
+    try loop.nextTick(a);
+    try loop.nextTick(b);
+    try loop.nextTick(c);
+
+    const Order = struct {
+        const Self = @This();
+        seen: [4]Tag = undefined,
+        served: usize = 0,
+        defer_next: bool = false,
+
+        fn on(self: *Self, l: *Loop(Tag), cqe: Loop(Tag).Cqe) !void {
+            self.seen[self.served] = cqe.tag;
+            self.served += 1;
+            if (cqe.tag.slot == 1) {
+                // A new hello parks during this pass, behind the queue, and
+                // the pass ends here.
+                try l.nextTick(arrival);
+                l.stopDeferred();
+                l.stop();
+            }
+        }
+    };
+    var app: Order = .{};
+
+    _ = try loop.tick(&app, Order.on, .no_wait);
+    // Only the head was served; everything else kept its place, with the
+    // arrival from this pass at the tail.
+    try testing.expectEqual(@as(usize, 1), app.served);
+    try testing.expectEqual(a.slot, app.seen[0].slot);
+    try testing.expectEqual(@as(usize, 3), loop.deferred_len);
+
+    // The next pass resumes at the head, not at the arrival: b, then c, then
+    // the tag that parked during the previous pass.
+    _ = try loop.tick(&app, Order.on, .no_wait);
+    try testing.expectEqual(@as(usize, 4), app.served);
+    try testing.expectEqual(b.slot, app.seen[1].slot);
+    try testing.expectEqual(c.slot, app.seen[2].slot);
+    try testing.expectEqual(arrival.slot, app.seen[3].slot);
+}

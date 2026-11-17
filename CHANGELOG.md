@@ -5,6 +5,16 @@ All notable changes to uring are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-17
+
+### Added
+
+- `Loop.stopDeferred`: end this pass's deferred dispatch, leaving the rest of
+  the queue in place and in order. A handler that cannot take more deferred
+  work this pass calls it instead of deferring the remainder again: deferring
+  moves those tags behind whatever arrived during the pass, which starves them
+  under a steady arrival rate. The next pass resumes at the same head.
+
 ## [0.3.0] - 2026-11-17
 
 ### Changed
