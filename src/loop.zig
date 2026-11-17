@@ -7,7 +7,7 @@
 //! when.
 //!
 //! What the loop owns: the ring, the submit discipline, the enter, the cached
-//! clock, the posted queue, and the one decode from `user_data` to `Tag`.
+//! clock, the deferred queue, and the one decode from `user_data` to `Tag`.
 //! What it refuses: buffers, fds, connection state, close ordering, and any
 //! opinion about what a completion means. It never closes a descriptor, never
 //! frees a byte, and never rearms an operation.
@@ -44,9 +44,9 @@ pub fn Loop(comptime Tag: type) type {
             /// the loop allocates nothing and holds nothing back. Bigger
             /// batches mean fewer enters and more work per tick.
             cqes: []linux.io_uring_cqe,
-            /// The posted queue, one slot per pending `post`. A zero-length
-            /// slice disables `post`.
-            posted: []Tag = &.{},
+            /// The deferred queue: one slot per tag waiting for `nextTick`. A
+            /// zero-length slice disables `nextTick`.
+            deferred: []Tag = &.{},
             /// Flush the submission queue once this many slots are left. A
             /// prep that finds the queue full retries once and then fails
             /// with `error.SubmissionQueueFull`, so the loop publishes early
@@ -61,9 +61,9 @@ pub fn Loop(comptime Tag: type) type {
             /// caller knows which operation it armed.
             res: i32,
             flags: u32,
-            /// True when the loop synthesized this from `post`: no kernel
+            /// True when the loop synthesized this with `nextTick`: no kernel
             /// operation finished, and `res` is zero.
-            posted: bool = false,
+            deferred: bool = false,
 
             /// The errno in `res`, or `.SUCCESS`. An io_uring result uses the
             /// syscall convention, so this is the std decoder and not a
@@ -107,21 +107,21 @@ pub fn Loop(comptime Tag: type) type {
             ticks: u64,
             /// Completions the kernel delivered.
             cqes: u64,
-            /// Tags the loop synthesized from `post`.
-            posted: u64,
+            /// Tags the loop synthesized from `nextTick`.
+            deferred: u64,
 
             const zero: Stats = .{
                 .ticks = 0,
                 .cqes = 0,
-                .posted = 0,
+                .deferred = 0,
             };
         };
 
         ring: Ring,
         cqes: []linux.io_uring_cqe,
-        posted: []Tag,
-        posted_head: usize = 0,
-        posted_len: usize = 0,
+        deferred: []Tag,
+        deferred_head: usize = 0,
+        deferred_len: usize = 0,
         sq_floor: u16,
         now_ns: i64 = 0,
         stopped: bool = false,
@@ -133,7 +133,7 @@ pub fn Loop(comptime Tag: type) type {
             return .{
                 .ring = try .init(options.entries, options.setup),
                 .cqes = options.cqes,
-                .posted = options.posted,
+                .deferred = options.deferred,
                 .sq_floor = options.sq_floor,
                 // A deadline computed from a zeroed clock is in the past, so
                 // the clock starts at init.
@@ -192,14 +192,23 @@ pub fn Loop(comptime Tag: type) type {
         /// Post `tag` for dispatch on the next tick, as though it completed.
         /// A post from inside a handler runs one tick later, never in the
         /// middle of the current batch.
-        pub fn post(self: *Self, tag: Tag) error{PostedFull}!void {
-            if (self.posted_len == self.posted.len) return error.PostedFull;
-            const tail = (self.posted_head + self.posted_len) % self.posted.len;
-            self.posted[tail] = tag;
-            self.posted_len += 1;
+        /// Dispatch `tag` on the next tick, as though a completion had
+        /// arrived for it: the handler sees `res` zero, no flags, and
+        /// `Cqe.deferred` set. Nothing is submitted, and the kernel is not
+        /// involved; this is the loop's one synthetic completion.
+        ///
+        /// A `nextTick` from inside a handler runs one tick later, so work
+        /// that arrived while dispatching cannot extend the current pass. The
+        /// queue is the caller's slice from `Options.deferred`, and a full
+        /// queue returns `error.DeferredFull` rather than dropping the tag.
+        pub fn nextTick(self: *Self, tag: Tag) error{DeferredFull}!void {
+            if (self.deferred_len == self.deferred.len) return error.DeferredFull;
+            const tail = (self.deferred_head + self.deferred_len) % self.deferred.len;
+            self.deferred[tail] = tag;
+            self.deferred_len += 1;
         }
 
-        /// One tick: wait, reap, dispatch, post, submit.
+        /// One tick: wait, reap, dispatch, defer, submit.
         ///
         /// `handler` is `fn (ctx: anytype, loop: *Self, cqe: Cqe) !void`, known
         /// at comptime, so each completion is a direct call with no function
@@ -211,8 +220,8 @@ pub fn Loop(comptime Tag: type) type {
         pub const Tick = struct {
             /// Completions from the kernel this tick.
             cqes: u32,
-            /// Posted tags this tick.
-            posted: u32,
+            /// Deferred tags this tick.
+            deferred: u32,
             /// The tick made a GETEVENTS enter. Under DEFER_TASKRUN this is
             /// the only way the kernel runs deferred completions.
             entered: bool,
@@ -263,10 +272,10 @@ pub fn Loop(comptime Tag: type) type {
             // the clock themselves, in every case.
             const start_ns = clock.monotonic();
 
-            // The posted count is a snapshot taken before dispatch: one
-            // posted from a handler above runs on the next tick, so a handler
-            // that posts cannot starve the enter.
-            const posted = self.posted_len;
+            // The deferred count is a snapshot taken before dispatch: a tag
+            // queued by a handler above runs on the next tick, so a handler
+            // that queues work cannot starve the enter.
+            const deferred = self.deferred_len;
 
             // Publish whatever is queued before reaping, so work armed outside
             // a handler is not a tick late. The guard is `sqPending`, not a
@@ -288,7 +297,7 @@ pub fn Loop(comptime Tag: type) type {
                 },
                 .no_wait, .once, .until => {
                     reaped = try self.ring.copyCqes(self.cqes);
-                    if (reaped == 0 and posted == 0) {
+                    if (reaped == 0 and deferred == 0) {
                         entered = true;
                         switch (wait) {
                             .poll => unreachable,
@@ -332,7 +341,7 @@ pub fn Loop(comptime Tag: type) type {
 
             const done: Tick = .{
                 .cqes = reaped,
-                .posted = @intCast(posted),
+                .deferred = @intCast(deferred),
                 .entered = entered,
                 .waited = waited,
                 .start_ns = start_ns,
@@ -345,13 +354,13 @@ pub fn Loop(comptime Tag: type) type {
             for (self.cqes[0..reaped]) |cqe| try handler(ctx, self, Self.fromRaw(cqe));
             self.stats.cqes += reaped;
 
-            var n = posted;
+            var n = deferred;
             while (n > 0) : (n -= 1) {
-                const tag = self.posted[self.posted_head];
-                self.posted_head = (self.posted_head + 1) % self.posted.len;
-                self.posted_len -= 1;
-                self.stats.posted += 1;
-                try handler(ctx, self, .{ .tag = tag, .res = 0, .flags = 0, .posted = true });
+                const tag = self.deferred[self.deferred_head];
+                self.deferred_head = (self.deferred_head + 1) % self.deferred.len;
+                self.deferred_len -= 1;
+                self.stats.deferred += 1;
+                try handler(ctx, self, .{ .tag = tag, .res = 0, .flags = 0, .deferred = true });
             }
 
             self.stats.ticks += 1;

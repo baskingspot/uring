@@ -15,7 +15,7 @@ tag, never closes a descriptor, never frees a byte, and never rearms an
 operation. The handler is known at comptime, so every completion is a direct
 call.
 
-- [The loop](#the-loop): `Loop(Tag).tick` is one pass, publish, reap, enter, dispatch, submit, and `run`, `post`, `stop`, and `now` are around it.
+- [The loop](#the-loop): `Loop(Tag).tick` is one pass, publish, reap, enter, dispatch, submit, and `run`, `nextTick`, `stop`, and `now` are around it.
 - [The tag](#the-tag): any 64-bit type. `Cqe` decodes it once and hands it to your handler.
 - [Waiting](#waiting): `Wait.poll`, `.no_wait`, `.once`, and `.until`, and what each one costs.
 - [Deadlines](#deadlines): a deadline through the enter, with no submitted operation, and `timeout` when you want the kernel to own the clock.
@@ -33,7 +33,7 @@ The [API reference](api/) documents every public symbol.
 ## Install
 
 ```sh
-zig fetch --save https://baskingspot.dev/uring/v0.2.0.tar.gz
+zig fetch --save https://baskingspot.dev/uring/v0.3.0.tar.gz
 ```
 
 Add the module in `build.zig`:
@@ -121,24 +121,25 @@ shutdown that still has connections to serve needs ticks after the decision.
 1. Publish: if the submission queue holds anything, submit it. Work armed
    outside a handler is therefore never a tick late.
 2. Reap: copy the ready completions into your batch.
-3. Enter: only when step 2 found nothing and there is no posted tag. What kind
+3. Enter: only when step 2 found nothing and nothing is deferred. What kind
    of enter is `wait`; see [Waiting](#waiting).
 4. Dispatch: one direct call to your handler per completion, then one per
-   posted tag. The posted count is snapshotted before dispatch, so a handler
-   that posts cannot starve the enter.
+   deferred tag. The deferred count is snapshotted before dispatch, so a
+   handler that queues work cannot starve the enter.
 5. Submit: publish whatever step 4 armed.
 
-`tick` returns a `Tick`: the completion and posted counts it dispatched,
+`tick` returns a `Tick`: the completion and deferred counts it dispatched,
 whether it entered, whether that enter blocked, and the tick's clock span
 (`start_ns`, `now_ns`). A caller whose policy depends on the pass, a
 busy-poll gate, a task-work bound, reads those rather than sampling its own
 clock.
 
-`post(tag)` dispatches a tag on the next pass as though a completion had
-arrived, with `res` zero and `Cqe.posted` set. It is how a caller parks work
-that the kernel did not produce, and it is bounded: the queue is a slice you
-pass as `Options.posted`, and a full queue returns `error.PostedFull` rather
-than dropping the tag.
+`nextTick(tag)` dispatches a tag on the next pass as though a completion had
+arrived, with `res` zero and `Cqe.deferred` set. Nothing is submitted and the
+kernel is not involved: it is the loop's one synthetic completion. It is how a
+caller parks work that the kernel did not produce, and it is bounded: the queue
+is a slice you pass as `Options.deferred`, and a full queue returns
+`error.DeferredFull` rather than dropping the tag.
 
 `stop()` asks the loop to finish and `run` honors it between passes.
 `now()` is the tick's sample.
@@ -162,7 +163,7 @@ There is no registration step and no per-tag allocation: the conversion is a
 `@bitCast` (or `@intFromPtr`), and the loop's only opinion about it is that it
 must be 64 bits, which is a compile error otherwise.
 
-`Cqe` carries `tag`, `res`, `flags`, and `posted`, plus three helpers:
+`Cqe` carries `tag`, `res`, `flags`, and `deferred`, plus three helpers:
 `errno()` (the `linux.E` in `res`, using the standard library's decoder),
 `more()` (the operation stays armed, a multishot), and `bufferId()` (which
 provided buffer the kernel filled).

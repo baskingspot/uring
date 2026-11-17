@@ -5,6 +5,16 @@ All notable changes to uring are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-17
+
+### Changed
+
+- `Loop.post` is `Loop.nextTick`, and the queue and flag it feeds are named
+  `deferred`: `Options.deferred`, `Loop.deferred_len`, `Cqe.deferred`,
+  `Tick.deferred`, and `error.DeferredFull`. "Post" read like posting to the
+  ring, which it is not: the loop synthesizes a completion for a tag and
+  dispatches it next pass, with nothing submitted.
+
 ## [0.2.0] - 2026-11-16
 
 ### Added

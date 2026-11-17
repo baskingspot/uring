@@ -26,17 +26,17 @@ const App = struct {
     seen: [16]Tag = undefined,
     results: [16]i32 = undefined,
     count: usize = 0,
-    posted_seen: usize = 0,
+    deferred_seen: usize = 0,
     stop_at: usize = 0,
-    post_back: bool = false,
+    defer_back: bool = false,
 
     fn onCompletion(app: *App, loop: *Loop(Tag), cqe: Loop(Tag).Cqe) !void {
         if (app.count == app.seen.len) return error.BatchFull;
         app.seen[app.count] = cqe.tag;
         app.results[app.count] = cqe.res;
         app.count += 1;
-        if (cqe.posted) app.posted_seen += 1;
-        if (app.post_back and cqe.tag.op == .send) try loop.post(cqe.tag);
+        if (cqe.deferred) app.deferred_seen += 1;
+        if (app.defer_back and cqe.tag.op == .send) try loop.nextTick(cqe.tag);
         if (app.stop_at != 0 and app.count == app.stop_at) loop.stop();
     }
 };
@@ -56,7 +56,7 @@ test "a tag of op, slot, and generation survives the ring unchanged" {
     try testing.expectEqual(@as(u16, 0xBEEF), app.seen[0].slot);
     try testing.expectEqual(@as(u16, 0x1234), app.seen[0].gen);
     try testing.expectEqual(Tag.Op.recv, app.seen[0].op);
-    try testing.expectEqual(@as(usize, 0), app.posted_seen);
+    try testing.expectEqual(@as(usize, 0), app.deferred_seen);
 }
 
 test "a pointer tag works the same way" {
@@ -132,57 +132,57 @@ test "the enter deadline ends a tick with nothing in flight" {
     try testing.expect(loop.now() > start);
 }
 
-test "post dispatches without a kernel completion, one tick later" {
+test "nextTick dispatches without a kernel completion, one tick later" {
     var cqes: [8]linux.io_uring_cqe = undefined;
-    var posted: [4]Tag = undefined;
-    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .posted = &posted });
+    var deferred: [4]Tag = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .deferred = &deferred });
     defer loop.deinit();
 
     const tag: Tag = .{ .op = .send, .slot = 1, .gen = 1 };
-    try loop.post(tag);
+    try loop.nextTick(tag);
 
     var app: App = .{};
     _ = try loop.tick(&app, App.onCompletion, .no_wait);
     try testing.expectEqual(@as(usize, 1), app.count);
-    try testing.expectEqual(@as(usize, 1), app.posted_seen);
+    try testing.expectEqual(@as(usize, 1), app.deferred_seen);
     try testing.expectEqual(@as(u16, 1), app.seen[0].slot);
     try testing.expectEqual(@as(u64, 0), loop.stats.cqes);
 }
 
-test "a post from a handler runs on the next tick, never inside the batch" {
+test "a nextTick from a handler runs on the next tick, never inside the batch" {
     var cqes: [8]linux.io_uring_cqe = undefined;
-    var posted: [4]Tag = undefined;
-    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .posted = &posted });
+    var deferred: [4]Tag = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .deferred = &deferred });
     defer loop.deinit();
 
     _ = try loop.nop(.{ .op = .send, .slot = 5, .gen = 1 });
 
-    var app: App = .{ .post_back = true };
+    var app: App = .{ .defer_back = true };
     _ = try loop.tick(&app, App.onCompletion, .once);
     // The completion was dispatched, and its handler queued one post.
     try testing.expectEqual(@as(usize, 1), app.count);
-    try testing.expectEqual(@as(usize, 0), app.posted_seen);
-    try testing.expectEqual(@as(usize, 1), loop.posted_len);
+    try testing.expectEqual(@as(usize, 0), app.deferred_seen);
+    try testing.expectEqual(@as(usize, 1), loop.deferred_len);
 
     _ = try loop.tick(&app, App.onCompletion, .no_wait);
     try testing.expectEqual(@as(usize, 2), app.count);
-    try testing.expectEqual(@as(usize, 1), app.posted_seen);
+    try testing.expectEqual(@as(usize, 1), app.deferred_seen);
 }
 
-test "a full posted queue refuses rather than dropping" {
+test "a full deferred queue refuses rather than dropping" {
     var cqes: [8]linux.io_uring_cqe = undefined;
-    var posted: [1]Tag = undefined;
-    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .posted = &posted });
+    var deferred: [1]Tag = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .deferred = &deferred });
     defer loop.deinit();
 
     const tag: Tag = .{ .op = .timer, .slot = 0, .gen = 0 };
-    try loop.post(tag);
-    try testing.expectError(error.PostedFull, loop.post(tag));
+    try loop.nextTick(tag);
+    try testing.expectError(error.DeferredFull, loop.nextTick(tag));
 
     var none: [0]Tag = undefined;
-    var loop_none: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .posted = &none });
+    var loop_none: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .deferred = &none });
     defer loop_none.deinit();
-    try testing.expectError(error.PostedFull, loop_none.post(tag));
+    try testing.expectError(error.DeferredFull, loop_none.nextTick(tag));
 }
 
 test "run ticks until a handler stops it" {
@@ -220,8 +220,8 @@ test "tick ignores stop, because a shutdown still has work to do" {
     // connections it holds. A tick that no-ops after stop would make that
     // impossible without a second flag.
     var cqes: [8]linux.io_uring_cqe = undefined;
-    var posted: [4]Tag = undefined;
-    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .posted = &posted });
+    var deferred: [4]Tag = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes, .deferred = &deferred });
     defer loop.deinit();
 
     var app: App = .{};
@@ -233,7 +233,7 @@ test "tick ignores stop, because a shutdown still has work to do" {
     try testing.expectEqual(@as(usize, 0), app.count);
 
     // tick still does one pass.
-    try loop.post(.{ .op = .timer, .slot = 3, .gen = 1 });
+    try loop.nextTick(.{ .op = .timer, .slot = 3, .gen = 1 });
     _ = try loop.tick(&app, App.onCompletion, .no_wait);
     try testing.expectEqual(@as(usize, 1), app.count);
     try testing.expectEqual(@as(u16, 3), app.seen[0].slot);
@@ -283,7 +283,7 @@ test "a tick reports the facts a caller's policy needs" {
     // A tick with work already complete does not enter.
     const busy = try loop.tick(&app, App.onCompletion, .no_wait);
     try testing.expectEqual(@as(u32, 1), busy.cqes);
-    try testing.expectEqual(@as(u32, 0), busy.posted);
+    try testing.expectEqual(@as(u32, 0), busy.deferred);
     try testing.expect(!busy.entered);
     try testing.expect(!busy.waited);
     try testing.expect(loop.now() > 0);
