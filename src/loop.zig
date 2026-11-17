@@ -215,6 +215,11 @@ pub fn Loop(comptime Tag: type) type {
         /// deferring moves them behind whatever arrived during the pass, which
         /// starves them under a steady arrival rate. The next pass resumes at
         /// the same head.
+        ///
+        /// It takes effect after the current handler returns, and the tag that
+        /// handler was given has already been popped: a caller must finish its
+        /// work, then stop. Stopping instead of working consumes that tag
+        /// undriven.
         pub fn stopDeferred(self: *Self) void {
             self.deferred_stopped = true;
         }
