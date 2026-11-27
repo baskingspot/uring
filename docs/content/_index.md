@@ -295,18 +295,23 @@ the loop.
 ```zig
 // On a data completion: held += 1; ...; try loop.bufferPut(&group, cqe);
 // held -= 1; then:
-if (receive_ended and held == 0) {
+if (receive_ended and held == 0 and !closing) {
     receive_ended = false;
     _ = try loop.recvMultishot(tag, &group, fd, 0);
 }
 
 // On -ENOBUFS with more() clear:
-if (held == 0) {
+if (held == 0 and !closing) {
     _ = try loop.recvMultishot(tag, &group, fd, 0); // every buffer is back
 } else {
     receive_ended = true; // the bufferPut that empties `held` re-arms
 }
 ```
+
+`held` is the buffer group's count, not one connection's. Do not re-arm a
+connection that is closing. If several connections share one group, keep the
+ended receives in a list and re-arm them when the group's count reaches zero;
+one `receive_ended` flag cannot remember more than one.
 
 With `buffers_count` buffers, it happens as soon as that many completions have
 consumed the ring without a `bufferPut`; a depth of 64 against 16 buffers
