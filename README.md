@@ -49,7 +49,7 @@ cancel.
 - [Deadlines](https://baskingspot.dev/uring/#deadlines): a deadline through the enter with no submitted operation, and `timeout` when you want the kernel to own the clock.
 - [Operations](https://baskingspot.dev/uring/#operations): every opcode the standard library encodes, each taking your tag and returning the SQE.
 - [Registered resources](https://baskingspot.dev/uring/#registered-resources): files, buffers, eventfds, NAPI, and the probe.
-- [Provided buffers](https://baskingspot.dev/uring/#provided-buffers): `BufferGroup` with a multishot receive that fills ring buffers the kernel picks.
+- [Provided buffers](https://baskingspot.dev/uring/#provided-buffers): `BufferGroup` with a multishot receive that fills ring buffers the kernel picks. `std` requests incremental consumption (a completion is a chunk); `initBufferGroup(..., .{ .incremental = false })` registers whole-buffer mode, where a completion is one message on a message socket.
 - [The ring](https://baskingspot.dev/uring/#the-ring): `Ring`, its setup struct, and the submit discipline that keeps the queue from filling.
 - [Performance](https://baskingspot.dev/uring/#performance): the loop against the equivalent hand-written loop, measured: about 3 ns per completion and two clock reads per idle pass.
 

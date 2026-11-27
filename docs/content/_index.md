@@ -266,6 +266,58 @@ The `*Direct` variants take a destination index for a file the kernel creates:
 `socketDirectAlloc`, `closeDirect`. `IORING_FILE_INDEX_ALLOC` lets the kernel
 pick, and the completion's `res` is the index it chose.
 
+## Serving a socket
+
+Two socket settings decide whether a serving loop looks fast or broken.
+
+`TCP_NODELAY`: Nagle holds the server's next small response while an earlier
+one is unacknowledged, and the client delays the ACK because it is waiting for
+replies and has nothing outbound to carry it. In the Project Zero spike, a
+16-byte response at depth 4 went from 274k to 178 commands/s within one
+window, 22 ms per window. Set it on the accepted socket, or once on the
+listener, because Linux copies the option to accepted sockets:
+
+```zig
+const one = std.mem.toBytes(@as(c_int, 1));
+try std.posix.setsockopt(conn_fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, &one);
+```
+
+`recvMultishot` ends with `-ENOBUFS` when the provided-buffer group empties:
+`res == -ENOBUFS`, `more()` clear, no `F_BUFFER`. That is flow control, not a
+dead client. The receive is over; re-arm it once the ring has a buffer again.
+Count the buffers the kernel handed you and `bufferPut` has not returned
+(`held`). If none is outstanding when the `-ENOBUFS` completion is handled, the
+puts already ran earlier in the same batch and the ring is refilled, so re-arm
+there. Otherwise re-arm from the `bufferPut` that takes `held` to zero.
+Re-arming with an empty ring answers `-ENOBUFS` again immediately, which spins
+the loop.
+
+```zig
+// On a data completion: held += 1; ...; try loop.bufferPut(&group, cqe);
+// held -= 1; then:
+if (receive_ended and held == 0 and !closing) {
+    receive_ended = false;
+    _ = try loop.recvMultishot(tag, &group, fd, 0);
+}
+
+// On -ENOBUFS with more() clear:
+if (held == 0 and !closing) {
+    _ = try loop.recvMultishot(tag, &group, fd, 0); // every buffer is back
+} else {
+    receive_ended = true; // the bufferPut that empties `held` re-arms
+}
+```
+
+`held` is the buffer group's count, not one connection's. Do not re-arm a
+connection that is closing. If several connections share one group, keep the
+ended receives in a list and re-arm them when the group's count reaches zero;
+one `receive_ended` flag cannot remember more than one.
+
+With `buffers_count` buffers, it happens as soon as that many completions have
+consumed the ring without a `bufferPut`; a depth of 64 against 16 buffers
+reaches it constantly. A loop that treats every negative errno as a closed
+connection will drop live clients and then wait on work that never arrives.
+
 # Registered resources
 
 `Ring` covers what the kernel lets a ring register. Registration has no tag and
@@ -303,21 +355,65 @@ A buffer group is a ring of buffers the kernel fills directly, so a receive
 does not need a buffer chosen in advance and a multishot receive can keep
 arriving into different buffers.
 
-```zig
-var group: uring.BufferGroup = try .init(&loop.ring.inner, allocator, 0, 4096, 64);
-defer group.deinit(allocator);
+The registration decides what a completion means, and the two modes are not
+interchangeable.
 
-_ = try loop.recvMultishot(tag, &group, fd, 0);
+- `BufferGroup.init`, `std`'s constructor, **requests** incremental
+  consumption. The kernel retains a buffer across completions, sets
+  `IORING_CQE_F_BUF_MORE`, and writes further bytes at a further offset. One
+  buffer id carries a stream, and a completion is a chunk. `bufferPut`
+  advances the buffer's head; the buffer returns to the ring only when the
+  kernel is done with it. The request needs kernel 6.12; `std` retries without
+  the flag on an older kernel, which silently gives whole-buffer mode.
+- `uring.initBufferGroup(..., .{ .incremental = false })` registers
+  **whole-buffer** mode. The kernel consumes one buffer per completion, the
+  completion carries the id and the byte count, and `bufferPut` returns the
+  whole buffer to the ring.
+
+Whole-buffer mode gives one message per completion only when two things hold.
+The socket must preserve message boundaries (`SOCK.DGRAM` or `SOCK.SEQPACKET`;
+on a stream, a PDU can still span completions and framing stays the caller's
+job), and `buffer_size` must be at least the largest message. A message longer
+than the buffer is truncated silently, and if the recv flags include
+`MSG_TRUNC` the completion's `res` is the real message length, which can exceed
+`buffer_size`; do not pass `MSG_TRUNC` unless you handle that.
+
+An incremental group used for messages fails in two ways that are easy to miss.
+A message longer than the buffer's remaining room is truncated silently, with
+no error. And `bufferGet` reads from the buffer's tracked head, which only
+`bufferPut` advances, so taking the next completion for the same buffer id
+before returning the previous one reads from the previous message's offset.
+A whole-buffer completion may be held until `bufferPut`; an incremental one
+may not.
+
+```zig
+// Incremental: a completion is a chunk of a stream.
+var stream_group: uring.BufferGroup = try .init(&loop.ring.inner, allocator, 0, 4096, 64);
+defer stream_group.deinit(allocator);
+
+// Whole-buffer: a completion is one message.
+var message_group = try uring.initBufferGroup(
+    &loop.ring.inner,
+    allocator,
+    1,
+    4096,
+    64,
+    .{ .incremental = false },
+);
+defer message_group.deinit(allocator);
+
+_ = try loop.recvMultishot(tag, &message_group, fd, 0);
 
 // In the handler:
-const bytes = try loop.bufferGet(&group, cqe);
+const bytes = try loop.bufferGet(&message_group, cqe);
 try process(bytes);
-try loop.bufferPut(&group, cqe);
+try loop.bufferPut(&message_group, cqe);
 ```
 
-`bufferPut` handles incremental consumption: while the kernel sets
-`IORING_CQE_F_BUF_MORE` it keeps writing at the same offset, and the buffer
-returns to the ring only when the kernel is done with it.
+Consuming all `buffers_count` buffers before returning any ends the multishot
+receive with `-ENOBUFS` and no `F_MORE`, because the next receive selects a
+buffer before it reads. Re-arm it, and do not call `bufferPut` on that
+completion, because it carries no `F_BUFFER`.
 
 `provideBuffers` and `removeBuffers` are the older, per-operation way, and
 exist for a kernel without the buffer ring.

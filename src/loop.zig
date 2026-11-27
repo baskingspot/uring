@@ -16,12 +16,78 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 
 const clock = @import("clock.zig");
 
 /// The kernel's provided-buffer ring. `BufferGroup.init` takes the ring:
 /// `try uring.BufferGroup.init(&loop.ring.inner, allocator, group_id, size, count)`.
+///
+/// That constructor is `std`'s, and it requests incremental consumption: the
+/// kernel retains a buffer across completions and writes further bytes at a
+/// further offset, so one buffer id can produce several completions
+/// (`F_BUF_MORE`). A buffer is a stream chunk, not a message. The request
+/// needs kernel 6.12; `std` retries without the flag on an older kernel, which
+/// gives whole-buffer mode. `initBufferGroup` registers either mode
+/// explicitly, and whole-buffer mode consumes one buffer per completion.
 pub const BufferGroup = linux.IoUring.BufferGroup;
+
+/// How `initBufferGroup` registers the ring.
+// ast-grep-ignore: public-struct-field-default -- options bag: call sites set the one knob
+pub const BufferGroupOptions = struct {
+    /// Incremental consumption (`IOU_PBUF_RING_INC`, kernel 6.12): the kernel
+    /// keeps a buffer across completions, sets `F_BUF_MORE`, and writes at a
+    /// further offset. One buffer id carries a stream, not a message. On an
+    /// older kernel the registration falls back to whole-buffer mode.
+    ///
+    /// `false` is whole-buffer mode: the kernel consumes one buffer per
+    /// completion, the completion carries the id and its length, and `put`
+    /// returns that buffer to the ring.
+    incremental: bool = true,
+};
+
+/// A provided-buffer group registered with `std`'s hardcoded choice replaced
+/// by an explicit one. `std`'s `BufferGroup.init` always registers
+/// incrementally; this is the same group either way, and `get`, `put`, and
+/// `recvMultishot` work on both, because `put` already handles the
+/// non-incremental return.
+pub fn initBufferGroup(
+    ring: *linux.IoUring,
+    allocator: Allocator,
+    group_id: u16,
+    buffer_size: u32,
+    buffers_count: u16,
+    options: BufferGroupOptions,
+) !BufferGroup {
+    const buffers = try allocator.alloc(u8, buffer_size * buffers_count);
+    errdefer allocator.free(buffers);
+    const heads = try allocator.alloc(u32, buffers_count);
+    errdefer allocator.free(heads);
+
+    const br = try linux.IoUring.setup_buf_ring(ring.fd, buffers_count, group_id, .{
+        .inc = options.incremental,
+    });
+    linux.IoUring.buf_ring_init(br);
+
+    const mask = linux.IoUring.buf_ring_mask(buffers_count);
+    var i: u16 = 0;
+    while (i < buffers_count) : (i += 1) {
+        const pos = buffer_size * i;
+        heads[i] = 0;
+        linux.IoUring.buf_ring_add(br, buffers[pos..][0..buffer_size], i, mask, i);
+    }
+    linux.IoUring.buf_ring_advance(br, buffers_count);
+
+    return .{
+        .ring = ring,
+        .group_id = group_id,
+        .br = br,
+        .buffers = buffers,
+        .heads = heads,
+        .buffer_size = buffer_size,
+        .buffers_count = buffers_count,
+    };
+}
 const Ring = @import("Ring.zig").Ring;
 
 pub fn Loop(comptime Tag: type) type {
@@ -1082,8 +1148,15 @@ pub fn Loop(comptime Tag: type) type {
         }
 
         /// Multishot receive over a provided-buffer group: one SQE, one
-        /// `IORING_CQE_F_BUFFER` completion per buffer the kernel fills, until
-        /// the operation ends. Return the buffer with `bufferPut`.
+        /// `IORING_CQE_F_BUFFER` completion per buffer, until the operation
+        /// ends. In incremental mode (the default constructor) a buffer can
+        /// carry several completions and a completion is a chunk; with
+        /// `initBufferGroup(..., .{ .incremental = false })` one completion is
+        /// one whole buffer. Return it with `bufferPut`.
+        ///
+        /// When the group empties before a buffer is returned, the operation
+        /// ends with `-ENOBUFS`, `more()` clear, and no `F_BUFFER`. That is
+        /// flow control: re-arm the receive rather than closing the socket.
         pub fn recvMultishot(
             self: *Self,
             tag: Tag,
@@ -1101,9 +1174,9 @@ pub fn Loop(comptime Tag: type) type {
             return group.get_by_id(id)[0..@intCast(cqe.res)];
         }
 
-        /// Give the buffer back to the kernel. Incremental consumption
-        /// (`IORING_CQE_F_BUF_MORE`) is handled by the ring: the kernel keeps
-        /// writing at the same offset until the buffer is whole.
+        /// Give the buffer back to the kernel. `IORING_CQE_F_BUF_MORE` means
+        /// the kernel retained it and will write at a further offset; without
+        /// the flag the whole buffer is returned to the ring for reuse.
         pub fn bufferPut(_: *Self, group: *BufferGroup, cqe: Cqe) !void {
             try group.put(.{
                 .user_data = 0,
