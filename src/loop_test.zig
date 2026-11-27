@@ -486,8 +486,9 @@ test "provided buffers: incremental mode keeps one buffer across completions" {
         if (offset == 0 and !more) {
             // The registration fell back to whole-buffer mode: incremental
             // consumption needs kernel 6.12, and std retries without the flag.
-            // The whole-buffer test covers that mode; there is nothing to
-            // assert here.
+            // Return the buffer so the receive stays armed, and skip: the
+            // whole-buffer test covers that mode.
+            try loop.bufferPut(&group, cqe);
             fell_back = true;
             break;
         }
@@ -496,31 +497,41 @@ test "provided buffers: incremental mode keeps one buffer across completions" {
         offset += chunk.len;
     }
 
-    // The buffer is back in the ring: with one buffer, the next byte can only
-    // land in it.
-    cap.n = 0;
-    try testing.expectEqual(@as(usize, 1), linux.write(sv[0], "z", 1));
-    var spins: usize = 0;
-    while (cap.n < 1 and spins < 8) : (spins += 1) {
-        _ = try loop.tick(&cap, Capture.on, .once);
+    if (!fell_back) {
+        // The buffer is back in the ring: with one buffer, the next byte can
+        // only land in it.
+        cap.n = 0;
+        try testing.expectEqual(@as(usize, 1), linux.write(sv[0], "z", 1));
+        var spins: usize = 0;
+        while (cap.n < 1 and spins < 8) : (spins += 1) {
+            _ = try loop.tick(&cap, Capture.on, .once);
+        }
+        try testing.expectEqual(@as(usize, 1), cap.n);
+        try testing.expectEqual(buffer_id.?, cap.cqes[0].bufferId().?);
+        try testing.expectEqualStrings("z", try loop.bufferGet(&group, cap.cqes[0]));
+        try loop.bufferPut(&group, cap.cqes[0]);
     }
-    try testing.expectEqual(@as(usize, 1), cap.n);
-    try testing.expectEqual(buffer_id.?, cap.cqes[0].bufferId().?);
-    try testing.expectEqualStrings("z", try loop.bufferGet(&group, cap.cqes[0]));
-    try loop.bufferPut(&group, cap.cqes[0]);
 
+    // Cancel and reap with a deadline. The cancel's own completion and the
+    // receive's `-ECANCELED` may arrive in either order or together, and on
+    // the fallback path the receive may already have ended with `-ENOBUFS`,
+    // in which case the cancel answers `-ENOENT` and there is nothing armed.
     const recv_tag: Tag = .{ .op = .recv, .slot = 4, .gen = 1 };
-    cap.n = 0;
-    _ = try loop.cancel(.{ .op = .timer, .slot = 5, .gen = 1 }, recv_tag, 0);
+    const cancel_tag: Tag = .{ .op = .timer, .slot = 5, .gen = 1 };
+    _ = try loop.cancel(cancel_tag, recv_tag, 0);
     var cancelled = false;
-    spins = 0;
-    while (!cancelled and spins < 8) : (spins += 1) {
+    var cancel_done = false;
+    var spins: usize = 0;
+    while ((!cancel_done or (!cancelled and !fell_back)) and spins < 8) : (spins += 1) {
+        cap.n = 0;
         _ = try loop.tick(&cap, Capture.on, .{ .until = loop.now() + std.time.ns_per_s });
         for (cap.cqes[0..cap.n]) |cqe| {
+            if (cqe.tag.slot == cancel_tag.slot and cqe.tag.op == cancel_tag.op) cancel_done = true;
             if (cqe.errno() == linux.E.CANCELED) cancelled = true;
         }
     }
-    try testing.expect(cancelled);
+    try testing.expect(cancel_done);
+    if (!fell_back) try testing.expect(cancelled);
     if (fell_back) return error.SkipZigTest;
 }
 
