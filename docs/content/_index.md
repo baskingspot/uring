@@ -284,22 +284,27 @@ try std.posix.setsockopt(conn_fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, &one);
 
 `recvMultishot` ends with `-ENOBUFS` when the provided-buffer group empties:
 `res == -ENOBUFS`, `more()` clear, no `F_BUFFER`. That is flow control, not a
-dead client. The receive is over; re-arm it once a buffer has come back.
-Re-arming while the handlers still hold every buffer fails again at once and
-spins the loop, so the re-arm belongs on the path that returns buffers:
+dead client. The receive is over; re-arm it once the ring has a buffer again.
+Count the buffers the kernel handed you and `bufferPut` has not returned
+(`held`). If none is outstanding when the `-ENOBUFS` completion is handled, the
+puts already ran earlier in the same batch and the ring is refilled, so re-arm
+there. Otherwise re-arm from the `bufferPut` that takes `held` to zero.
+Re-arming with an empty ring answers `-ENOBUFS` again immediately, which spins
+the loop.
 
 ```zig
-if (cqe.errno() == .NOBUFS and !cqe.more()) {
-    // The group is empty. If a handler still holds buffers, re-arm from the
-    // path that returns them: an empty group answers -ENOBUFS immediately.
-    receive_ended = true;
-    return;
-}
-
-// After bufferPut, when the receive has ended and the ring has a buffer again:
-if (receive_ended) {
+// On a data completion: held += 1; ...; try loop.bufferPut(&group, cqe);
+// held -= 1; then:
+if (receive_ended and held == 0) {
     receive_ended = false;
     _ = try loop.recvMultishot(tag, &group, fd, 0);
+}
+
+// On -ENOBUFS with more() clear:
+if (held == 0) {
+    _ = try loop.recvMultishot(tag, &group, fd, 0); // every buffer is back
+} else {
+    receive_ended = true; // the bufferPut that empties `held` re-arms
 }
 ```
 

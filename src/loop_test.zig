@@ -499,9 +499,7 @@ test "provided buffers: incremental mode keeps one buffer across completions" {
     }
 
     // Cancel and reap with a deadline. The cancel's own completion and the
-    // receive's `-ECANCELED` may arrive in either order or together, and on
-    // the fallback path the receive may already have ended with `-ENOBUFS`,
-    // in which case the cancel answers `-ENOENT` and there is nothing armed.
+    // receive's `-ECANCELED` may arrive in either order or together.
     const recv_tag: Tag = .{ .op = .recv, .slot = 4, .gen = 1 };
     const cancel_tag: Tag = .{ .op = .timer, .slot = 5, .gen = 1 };
     _ = try loop.cancel(cancel_tag, recv_tag, 0);
