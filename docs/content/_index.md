@@ -270,11 +270,12 @@ pick, and the completion's `res` is the index it chose.
 
 Two socket settings decide whether a serving loop looks fast or broken.
 
-`TCP_NODELAY`: Nagle holds a small completion until the previous segment is
-acknowledged, and a client that is only sending has no inbound data to carry
-the ACK. In the Project Zero spike, a 16-byte completion at depth 4 went from
-274k to 178 commands/s within one window, 22 ms per window. Set it on the
-accepted socket, not the listener:
+`TCP_NODELAY`: Nagle holds the server's next small response while an earlier
+one is unacknowledged, and the client delays the ACK because it is waiting for
+replies and has nothing outbound to carry it. In the Project Zero spike, a
+16-byte response at depth 4 went from 274k to 178 commands/s within one
+window, 22 ms per window. Set it on the accepted socket, or once on the
+listener, because Linux copies the option to accepted sockets:
 
 ```zig
 const one = std.mem.toBytes(@as(c_int, 1));
@@ -282,21 +283,30 @@ try std.posix.setsockopt(conn_fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, &one);
 ```
 
 `recvMultishot` ends with `-ENOBUFS` when the provided-buffer group empties:
-`res = -105`, `more()` clear, no `F_BUFFER`. That is flow control, not a dead
-client. Re-arm the receive and return:
+`res == -ENOBUFS`, `more()` clear, no `F_BUFFER`. That is flow control, not a
+dead client. The receive is over; re-arm it once a buffer has come back.
+Re-arming while the handlers still hold every buffer fails again at once and
+spins the loop, so the re-arm belongs on the path that returns buffers:
 
 ```zig
 if (cqe.errno() == .NOBUFS and !cqe.more()) {
-    _ = try loop.recvMultishot(tag, &group, fd, 0);
+    // The group is empty. If a handler still holds buffers, re-arm from the
+    // path that returns them: an empty group answers -ENOBUFS immediately.
+    receive_ended = true;
     return;
+}
+
+// After bufferPut, when the receive has ended and the ring has a buffer again:
+if (receive_ended) {
+    receive_ended = false;
+    _ = try loop.recvMultishot(tag, &group, fd, 0);
 }
 ```
 
 With `buffers_count` buffers, it happens as soon as that many completions have
 consumed the ring without a `bufferPut`; a depth of 64 against 16 buffers
-reaches it constantly. A loop that treats every negative completion as a
-closed connection will drop live clients and then wait on work that never
-arrives.
+reaches it constantly. A loop that treats every negative errno as a closed
+connection will drop live clients and then wait on work that never arrives.
 
 # Registered resources
 
