@@ -266,6 +266,38 @@ The `*Direct` variants take a destination index for a file the kernel creates:
 `socketDirectAlloc`, `closeDirect`. `IORING_FILE_INDEX_ALLOC` lets the kernel
 pick, and the completion's `res` is the index it chose.
 
+## Serving a socket
+
+Two socket settings decide whether a serving loop looks fast or broken.
+
+`TCP_NODELAY`: Nagle holds a small completion until the previous segment is
+acknowledged, and a client that is only sending has no inbound data to carry
+the ACK. In the Project Zero spike, a 16-byte completion at depth 4 went from
+274k to 178 commands/s within one window, 22 ms per window. Set it on the
+accepted socket, not the listener:
+
+```zig
+const one = std.mem.toBytes(@as(c_int, 1));
+try std.posix.setsockopt(conn_fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, &one);
+```
+
+`recvMultishot` ends with `-ENOBUFS` when the provided-buffer group empties:
+`res = -105`, `more()` clear, no `F_BUFFER`. That is flow control, not a dead
+client. Re-arm the receive and return:
+
+```zig
+if (cqe.errno() == .NOBUFS and !cqe.more()) {
+    _ = try loop.recvMultishot(tag, &group, fd, 0);
+    return;
+}
+```
+
+With `buffers_count` buffers, it happens as soon as that many completions have
+consumed the ring without a `bufferPut`; a depth of 64 against 16 buffers
+reaches it constantly. A loop that treats every negative completion as a
+closed connection will drop live clients and then wait on work that never
+arrives.
+
 # Registered resources
 
 `Ring` covers what the kernel lets a ring register. Registration has no tag and

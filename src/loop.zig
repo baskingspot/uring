@@ -1153,6 +1153,10 @@ pub fn Loop(comptime Tag: type) type {
         /// carry several completions and a completion is a chunk; with
         /// `initBufferGroup(..., .{ .incremental = false })` one completion is
         /// one whole buffer. Return it with `bufferPut`.
+        ///
+        /// When the group empties before a buffer is returned, the operation
+        /// ends with `-ENOBUFS`, `more()` clear, and no `F_BUFFER`. That is
+        /// flow control: re-arm the receive rather than closing the socket.
         pub fn recvMultishot(
             self: *Self,
             tag: Tag,
