@@ -427,9 +427,12 @@ test "provided buffers: incremental mode keeps one buffer across completions" {
 
     var cqes: [8]linux.io_uring_cqe = undefined;
     var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
-    // `std`'s constructor: incremental consumption. One buffer carries the
-    // stream until it is full, and a completion is the new bytes, not a message.
-    var group: BufferGroup = try .init(&loop.ring.inner, testing.allocator, 0, 64, 4);
+    defer loop.deinit();
+    // `std`'s constructor requests incremental consumption. One buffer carries
+    // the stream until it is full, and a completion is the new bytes, not a
+    // message. One buffer, so a later completion can only come from it.
+    var group: BufferGroup = try .init(&loop.ring.inner, testing.allocator, 0, 64, 1);
+    defer group.deinit(testing.allocator);
 
     const Capture = struct {
         const Self = @This();
@@ -457,6 +460,7 @@ test "provided buffers: incremental mode keeps one buffer across completions" {
     const chunks = [_][]const u8{ payload[0..10], payload[10..15], payload[15..64] };
     var buffer_id: ?u16 = null;
     var offset: usize = 0;
+    var fell_back = false;
     for (chunks) |chunk| {
         try testing.expectEqual(chunk.len, linux.write(sv[0], chunk.ptr, chunk.len));
         cap.n = 0;
@@ -479,13 +483,21 @@ test "provided buffers: incremental mode keeps one buffer across completions" {
         try testing.expectEqualSlices(u8, chunk, bytes);
 
         const more = cqe.flags & linux.IORING_CQE_F_BUF_MORE != 0;
+        if (offset == 0 and !more) {
+            // The registration fell back to whole-buffer mode: incremental
+            // consumption needs kernel 6.12, and std retries without the flag.
+            // The whole-buffer test covers that mode; there is nothing to
+            // assert here.
+            fell_back = true;
+            break;
+        }
         try testing.expectEqual(offset + chunk.len < payload.len, more);
         try loop.bufferPut(&group, cqe);
         offset += chunk.len;
     }
-    try testing.expectEqual(payload.len, offset);
 
-    // The buffer is back in the ring: the next byte gets a completion.
+    // The buffer is back in the ring: with one buffer, the next byte can only
+    // land in it.
     cap.n = 0;
     try testing.expectEqual(@as(usize, 1), linux.write(sv[0], "z", 1));
     var spins: usize = 0;
@@ -493,6 +505,7 @@ test "provided buffers: incremental mode keeps one buffer across completions" {
         _ = try loop.tick(&cap, Capture.on, .once);
     }
     try testing.expectEqual(@as(usize, 1), cap.n);
+    try testing.expectEqual(buffer_id.?, cap.cqes[0].bufferId().?);
     try testing.expectEqualStrings("z", try loop.bufferGet(&group, cap.cqes[0]));
     try loop.bufferPut(&group, cap.cqes[0]);
 
@@ -508,9 +521,7 @@ test "provided buffers: incremental mode keeps one buffer across completions" {
         }
     }
     try testing.expect(cancelled);
-
-    group.deinit(testing.allocator);
-    loop.deinit();
+    if (fell_back) return error.SkipZigTest;
 }
 
 test "provided buffers: whole-buffer mode gives one completion per message" {

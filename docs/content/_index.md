@@ -329,9 +329,10 @@ than the buffer is truncated silently, and if the recv flags include
 An incremental group used for messages fails in two ways that are easy to miss.
 A message longer than the buffer's remaining room is truncated silently, with
 no error. And `bufferGet` reads from the buffer's tracked head, which only
-`bufferPut` advances, so taking the next completion before returning the
-previous one returns the previous message's bytes. A whole-buffer completion
-may be held until `bufferPut`; an incremental one may not.
+`bufferPut` advances, so taking the next completion for the same buffer id
+before returning the previous one reads from the previous message's offset.
+A whole-buffer completion may be held until `bufferPut`; an incremental one
+may not.
 
 ```zig
 // Incremental: a completion is a chunk of a stream.
@@ -357,9 +358,10 @@ try process(bytes);
 try loop.bufferPut(&message_group, cqe);
 ```
 
-A burst larger than `buffers_count` before the puts exhausts the ring: the
-multishot receive ends with `-ENOBUFS` and no `F_MORE`. Re-arm it, and do not
-call `bufferPut` on that completion, because it carries no `F_BUFFER`.
+Consuming all `buffers_count` buffers before returning any ends the multishot
+receive with `-ENOBUFS` and no `F_MORE`, because the next receive selects a
+buffer before it reads. Re-arm it, and do not call `bufferPut` on that
+completion, because it carries no `F_BUFFER`.
 
 `provideBuffers` and `removeBuffers` are the older, per-operation way, and
 exist for a kernel without the buffer ring.
