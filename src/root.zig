@@ -45,7 +45,9 @@
 //! and the probe (`Ring.supports` asks it about an op).
 //!
 //! Provided buffers are `BufferGroup` plus `recvMultishot`, `bufferGet`, and
-//! `bufferPut`.
+//! `bufferPut`. `std`'s `BufferGroup.init` registers incrementally, where one
+//! buffer carries a stream chunk and several completions; `initBufferGroup`
+//! takes `.{ .incremental = false }` for one whole buffer per completion.
 //!
 //! Not encoded, because `std` does not encode them: `msg_ring`, `futex_wait`,
 //! `futex_wake`, `futex_waitv`, `tee`, `madvise`, `openat2`,
@@ -57,6 +59,10 @@
 
 pub const Loop = @import("loop.zig").Loop;
 pub const Ring = @import("Ring.zig");
+
+pub const BufferGroup = @import("loop.zig").BufferGroup;
+pub const BufferGroupOptions = @import("loop.zig").BufferGroupOptions;
+pub const initBufferGroup = @import("loop.zig").initBufferGroup;
 
 test {
     _ = Ring;

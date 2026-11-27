@@ -8,6 +8,7 @@ const testing = std.testing;
 
 const Loop = @import("loop.zig").Loop;
 const BufferGroup = @import("loop.zig").BufferGroup;
+const initBufferGroup = @import("loop.zig").initBufferGroup;
 
 /// A packed tag in handoff's shape: an operation, a slot, and a generation that
 /// makes a stale completion detectable.
@@ -407,6 +408,107 @@ test "provided buffers: a multishot receive fills a ring buffer" {
     _ = try loop.tick(&cap, Capture.on, .once);
     _ = try loop.tick(&cap, Capture.on, .once);
     try testing.expectEqual(linux.E.CANCELED, cap.cqe.?.errno());
+
+    group.deinit(testing.allocator);
+    loop.deinit();
+}
+
+test "provided buffers: whole-buffer mode gives one completion per message" {
+    var sv: [2]linux.fd_t = undefined;
+    try testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.DGRAM, 0, &sv)),
+    );
+    defer for (sv) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
+    // `BufferGroup.init` would register incrementally, where one buffer can
+    // carry several completions and a completion is a chunk. Datagrams need
+    // one whole buffer per completion.
+    var group: BufferGroup = try initBufferGroup(
+        &loop.ring.inner,
+        testing.allocator,
+        0,
+        64,
+        4,
+        .{ .incremental = false },
+    );
+
+    const Capture = struct {
+        const Self = @This();
+
+        cqes: [8]Loop(Tag).Cqe = undefined,
+        n: usize = 0,
+
+        fn on(self: *Self, _: *Loop(Tag), cqe: Loop(Tag).Cqe) !void {
+            if (self.n == self.cqes.len) return error.BatchFull;
+            self.cqes[self.n] = cqe;
+            self.n += 1;
+        }
+    };
+    var cap: Capture = .{};
+
+    _ = try loop.recvMultishot(.{ .op = .recv, .slot = 4, .gen = 1 }, &group, sv[1], 0);
+    try loop.ring.submit();
+
+    const sent = [_][]const u8{ "one", "two", "three" };
+    for (sent) |msg| try testing.expectEqual(msg.len, linux.write(sv[0], msg.ptr, msg.len));
+
+    var spins: usize = 0;
+    while (cap.n < sent.len and spins < 8) : (spins += 1) {
+        _ = try loop.tick(&cap, Capture.on, .once);
+    }
+    try testing.expectEqual(@as(usize, 3), cap.n);
+
+    var found = [_]bool{ false, false, false };
+    var seen = [_]bool{ false, false, false, false };
+    for (cap.cqes[0..cap.n]) |cqe| {
+        try testing.expect(cqe.flags & linux.IORING_CQE_F_BUFFER != 0);
+        // Whole-buffer mode never retains a buffer across completions.
+        try testing.expectEqual(@as(u32, 0), cqe.flags & linux.IORING_CQE_F_BUF_MORE);
+        const id = cqe.bufferId().?;
+        try testing.expect(!seen[id]);
+        seen[id] = true;
+
+        const bytes = try loop.bufferGet(&group, cqe);
+        var matched = false;
+        for (sent, 0..) |want, i| {
+            if (std.mem.eql(u8, bytes, want)) {
+                found[i] = true;
+                matched = true;
+            }
+        }
+        try testing.expect(matched);
+        try loop.bufferPut(&group, cqe);
+    }
+    for (found) |yes| try testing.expect(yes);
+
+    // A buffer returned with `put` is reusable.
+    cap.n = 0;
+    try testing.expectEqual(@as(usize, 5), linux.write(sv[0], "again", 5));
+    spins = 0;
+    while (cap.n < 1 and spins < 8) : (spins += 1) {
+        _ = try loop.tick(&cap, Capture.on, .once);
+    }
+    try testing.expectEqual(@as(usize, 1), cap.n);
+    try testing.expectEqualStrings("again", try loop.bufferGet(&group, cap.cqes[0]));
+    try loop.bufferPut(&group, cap.cqes[0]);
+
+    // The multishot is still armed and borrows the ring: cancel and reap it
+    // before the unregister, as the incremental test does.
+    const recv_tag: Tag = .{ .op = .recv, .slot = 4, .gen = 1 };
+    cap.n = 0;
+    _ = try loop.cancel(.{ .op = .timer, .slot = 5, .gen = 1 }, recv_tag, 0);
+    _ = try loop.tick(&cap, Capture.on, .once);
+    _ = try loop.tick(&cap, Capture.on, .once);
+    var cancelled = false;
+    for (cap.cqes[0..cap.n]) |cqe| {
+        if (cqe.errno() == linux.E.CANCELED) cancelled = true;
+    }
+    try testing.expect(cancelled);
 
     group.deinit(testing.allocator);
     loop.deinit();

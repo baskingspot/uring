@@ -303,21 +303,48 @@ A buffer group is a ring of buffers the kernel fills directly, so a receive
 does not need a buffer chosen in advance and a multishot receive can keep
 arriving into different buffers.
 
-```zig
-var group: uring.BufferGroup = try .init(&loop.ring.inner, allocator, 0, 4096, 64);
-defer group.deinit(allocator);
+The registration decides what a completion means, and the two modes are not
+interchangeable.
 
-_ = try loop.recvMultishot(tag, &group, fd, 0);
+- `BufferGroup.init`, `std`'s constructor, registers **incrementally**. The
+  kernel retains a buffer across completions, sets `IORING_CQE_F_BUF_MORE`,
+  and writes further bytes at a further offset. One buffer id carries a
+  stream, and a completion is a chunk. `bufferPut` advances the buffer's head;
+  the buffer returns to the ring only when the kernel is done with it.
+- `uring.initBufferGroup(..., .{ .incremental = false })` registers
+  **whole-buffer** mode. The kernel consumes one buffer per completion, the
+  completion carries the id and the byte count, and `bufferPut` returns the
+  whole buffer to the ring. This is the mode for datagrams, PDUs, and anything
+  where one buffer id has to mean one message.
+
+An incremental group used for messages fails in a way that is easy to misread:
+a second completion arrives for an id whose bytes you have not finished with,
+and there is no message boundary to find. `F_BUF_MORE` is how the completion
+tells you the kernel kept the buffer.
+
+```zig
+// Incremental: a completion is a chunk of a stream.
+var stream_group: uring.BufferGroup = try .init(&loop.ring.inner, allocator, 0, 4096, 64);
+defer stream_group.deinit(allocator);
+
+// Whole-buffer: a completion is one message.
+var message_group = try uring.initBufferGroup(
+    &loop.ring.inner,
+    allocator,
+    1,
+    4096,
+    64,
+    .{ .incremental = false },
+);
+defer message_group.deinit(allocator);
+
+_ = try loop.recvMultishot(tag, &message_group, fd, 0);
 
 // In the handler:
-const bytes = try loop.bufferGet(&group, cqe);
+const bytes = try loop.bufferGet(&message_group, cqe);
 try process(bytes);
-try loop.bufferPut(&group, cqe);
+try loop.bufferPut(&message_group, cqe);
 ```
-
-`bufferPut` handles incremental consumption: while the kernel sets
-`IORING_CQE_F_BUF_MORE` it keeps writing at the same offset, and the buffer
-returns to the ring only when the kernel is done with it.
 
 `provideBuffers` and `removeBuffers` are the older, per-operation way, and
 exist for a kernel without the buffer ring.
