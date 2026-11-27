@@ -405,9 +405,109 @@ test "provided buffers: a multishot receive fills a ring buffer" {
     // a closed ring.
     const recv_tag: Tag = .{ .op = .recv, .slot = 4, .gen = 1 };
     _ = try loop.cancel(.{ .op = .timer, .slot = 5, .gen = 1 }, recv_tag, 0);
-    _ = try loop.tick(&cap, Capture.on, .once);
-    _ = try loop.tick(&cap, Capture.on, .once);
-    try testing.expectEqual(linux.E.CANCELED, cap.cqe.?.errno());
+    var spins: usize = 0;
+    while (cap.cqe == null or cap.cqe.?.errno() != linux.E.CANCELED) : (spins += 1) {
+        if (spins == 8) return error.TestUnexpectedResult;
+        _ = try loop.tick(&cap, Capture.on, .{ .until = loop.now() + std.time.ns_per_s });
+    }
+
+    group.deinit(testing.allocator);
+    loop.deinit();
+}
+
+test "provided buffers: incremental mode keeps one buffer across completions" {
+    var sv: [2]linux.fd_t = undefined;
+    try testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &sv)),
+    );
+    defer for (sv) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
+    // `std`'s constructor: incremental consumption. One buffer carries the
+    // stream until it is full, and a completion is the new bytes, not a message.
+    var group: BufferGroup = try .init(&loop.ring.inner, testing.allocator, 0, 64, 4);
+
+    const Capture = struct {
+        const Self = @This();
+
+        cqes: [8]Loop(Tag).Cqe = undefined,
+        n: usize = 0,
+
+        fn on(self: *Self, _: *Loop(Tag), cqe: Loop(Tag).Cqe) !void {
+            if (self.n == self.cqes.len) return error.BatchFull;
+            self.cqes[self.n] = cqe;
+            self.n += 1;
+        }
+    };
+    var cap: Capture = .{};
+
+    _ = try loop.recvMultishot(.{ .op = .recv, .slot = 4, .gen = 1 }, &group, sv[1], 0);
+    try loop.ring.submit();
+
+    var payload: [64]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @intCast('a' + (i % 26));
+
+    // A partial read leaves room, so the kernel keeps the buffer and posts the
+    // next bytes against the same id with `F_BUF_MORE`. The third write fills
+    // the buffer and the flag clears, which is when `put` recycles it.
+    const chunks = [_][]const u8{ payload[0..10], payload[10..15], payload[15..64] };
+    var buffer_id: ?u16 = null;
+    var offset: usize = 0;
+    for (chunks) |chunk| {
+        try testing.expectEqual(chunk.len, linux.write(sv[0], chunk.ptr, chunk.len));
+        cap.n = 0;
+        var spins: usize = 0;
+        while (cap.n < 1 and spins < 8) : (spins += 1) {
+            _ = try loop.tick(&cap, Capture.on, .once);
+        }
+        try testing.expectEqual(@as(usize, 1), cap.n);
+
+        const cqe = cap.cqes[0];
+        try testing.expectEqual(@as(i32, @intCast(chunk.len)), cqe.res);
+        const id = cqe.bufferId().?;
+        if (buffer_id) |wanted| {
+            try testing.expectEqual(wanted, id);
+        } else {
+            buffer_id = id;
+        }
+
+        const bytes = try loop.bufferGet(&group, cqe);
+        try testing.expectEqualSlices(u8, chunk, bytes);
+
+        const more = cqe.flags & linux.IORING_CQE_F_BUF_MORE != 0;
+        try testing.expectEqual(offset + chunk.len < payload.len, more);
+        try loop.bufferPut(&group, cqe);
+        offset += chunk.len;
+    }
+    try testing.expectEqual(payload.len, offset);
+
+    // The buffer is back in the ring: the next byte gets a completion.
+    cap.n = 0;
+    try testing.expectEqual(@as(usize, 1), linux.write(sv[0], "z", 1));
+    var spins: usize = 0;
+    while (cap.n < 1 and spins < 8) : (spins += 1) {
+        _ = try loop.tick(&cap, Capture.on, .once);
+    }
+    try testing.expectEqual(@as(usize, 1), cap.n);
+    try testing.expectEqualStrings("z", try loop.bufferGet(&group, cap.cqes[0]));
+    try loop.bufferPut(&group, cap.cqes[0]);
+
+    const recv_tag: Tag = .{ .op = .recv, .slot = 4, .gen = 1 };
+    cap.n = 0;
+    _ = try loop.cancel(.{ .op = .timer, .slot = 5, .gen = 1 }, recv_tag, 0);
+    var cancelled = false;
+    spins = 0;
+    while (!cancelled and spins < 8) : (spins += 1) {
+        _ = try loop.tick(&cap, Capture.on, .{ .until = loop.now() + std.time.ns_per_s });
+        for (cap.cqes[0..cap.n]) |cqe| {
+            if (cqe.errno() == linux.E.CANCELED) cancelled = true;
+        }
+    }
+    try testing.expect(cancelled);
 
     group.deinit(testing.allocator);
     loop.deinit();
@@ -427,7 +527,9 @@ test "provided buffers: whole-buffer mode gives one completion per message" {
     var loop: Loop(Tag) = try .init(.{ .entries = 8, .cqes = &cqes });
     // `BufferGroup.init` would register incrementally, where one buffer can
     // carry several completions and a completion is a chunk. Datagrams need
-    // one whole buffer per completion.
+    // one whole buffer per completion. The `F_BUF_MORE` assertion below only
+    // bites where the kernel honors `IOU_PBUF_RING_INC` (6.12); on an older
+    // kernel both registrations are whole-buffer and it passes vacuously.
     var group: BufferGroup = try initBufferGroup(
         &loop.ring.inner,
         testing.allocator,
@@ -486,27 +588,38 @@ test "provided buffers: whole-buffer mode gives one completion per message" {
     }
     for (found) |yes| try testing.expect(yes);
 
-    // A buffer returned with `put` is reusable.
-    cap.n = 0;
-    try testing.expectEqual(@as(usize, 5), linux.write(sv[0], "again", 5));
-    spins = 0;
-    while (cap.n < 1 and spins < 8) : (spins += 1) {
-        _ = try loop.tick(&cap, Capture.on, .once);
+    // Two more messages. The first takes the buffer the three above never
+    // touched; the second can only complete from a buffer `put` returned, so
+    // it proves the whole-buffer return re-added to the ring.
+    const follow = [_][]const u8{ "again", "twice" };
+    for (follow, 0..) |msg, i| {
+        cap.n = 0;
+        try testing.expectEqual(msg.len, linux.write(sv[0], msg.ptr, msg.len));
+        spins = 0;
+        while (cap.n < 1 and spins < 8) : (spins += 1) {
+            _ = try loop.tick(&cap, Capture.on, .once);
+        }
+        try testing.expectEqual(@as(usize, 1), cap.n);
+        const cqe = cap.cqes[0];
+        try testing.expectEqual(@as(i32, @intCast(msg.len)), cqe.res);
+        try testing.expect(cqe.flags & linux.IORING_CQE_F_BUFFER != 0);
+        if (i == 1) try testing.expect(seen[cqe.bufferId().?]);
+        try testing.expectEqualStrings(msg, try loop.bufferGet(&group, cqe));
+        try loop.bufferPut(&group, cqe);
     }
-    try testing.expectEqual(@as(usize, 1), cap.n);
-    try testing.expectEqualStrings("again", try loop.bufferGet(&group, cap.cqes[0]));
-    try loop.bufferPut(&group, cap.cqes[0]);
 
     // The multishot is still armed and borrows the ring: cancel and reap it
     // before the unregister, as the incremental test does.
     const recv_tag: Tag = .{ .op = .recv, .slot = 4, .gen = 1 };
     cap.n = 0;
     _ = try loop.cancel(.{ .op = .timer, .slot = 5, .gen = 1 }, recv_tag, 0);
-    _ = try loop.tick(&cap, Capture.on, .once);
-    _ = try loop.tick(&cap, Capture.on, .once);
     var cancelled = false;
-    for (cap.cqes[0..cap.n]) |cqe| {
-        if (cqe.errno() == linux.E.CANCELED) cancelled = true;
+    spins = 0;
+    while (!cancelled and spins < 8) : (spins += 1) {
+        _ = try loop.tick(&cap, Capture.on, .{ .until = loop.now() + std.time.ns_per_s });
+        for (cap.cqes[0..cap.n]) |cqe| {
+            if (cqe.errno() == linux.E.CANCELED) cancelled = true;
+        }
     }
     try testing.expect(cancelled);
 

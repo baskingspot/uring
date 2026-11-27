@@ -45,9 +45,10 @@
 //! and the probe (`Ring.supports` asks it about an op).
 //!
 //! Provided buffers are `BufferGroup` plus `recvMultishot`, `bufferGet`, and
-//! `bufferPut`. `std`'s `BufferGroup.init` registers incrementally, where one
-//! buffer carries a stream chunk and several completions; `initBufferGroup`
-//! takes `.{ .incremental = false }` for one whole buffer per completion.
+//! `bufferPut`. `std`'s `BufferGroup.init` requests incremental consumption
+//! (kernel 6.12; older kernels fall back to whole-buffer), where one buffer
+//! carries a stream chunk and several completions; `initBufferGroup` takes
+//! `.{ .incremental = false }` for one whole buffer per completion.
 //!
 //! Not encoded, because `std` does not encode them: `msg_ring`, `futex_wait`,
 //! `futex_wake`, `futex_waitv`, `tee`, `madvise`, `openat2`,

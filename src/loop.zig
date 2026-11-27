@@ -23,19 +23,22 @@ const clock = @import("clock.zig");
 /// The kernel's provided-buffer ring. `BufferGroup.init` takes the ring:
 /// `try uring.BufferGroup.init(&loop.ring.inner, allocator, group_id, size, count)`.
 ///
-/// That constructor is `std`'s, and it registers incrementally: the kernel
-/// retains a buffer across completions and writes further bytes at a further
-/// offset, so one buffer id can produce several completions (`F_BUF_MORE`).
-/// A buffer is a stream chunk, not a message. `initBufferGroup` registers
-/// without that flag, where one completion consumes one whole buffer.
+/// That constructor is `std`'s, and it requests incremental consumption: the
+/// kernel retains a buffer across completions and writes further bytes at a
+/// further offset, so one buffer id can produce several completions
+/// (`F_BUF_MORE`). A buffer is a stream chunk, not a message. The request
+/// needs kernel 6.12; `std` retries without the flag on an older kernel, which
+/// gives whole-buffer mode. `initBufferGroup` registers either mode
+/// explicitly, and whole-buffer mode consumes one buffer per completion.
 pub const BufferGroup = linux.IoUring.BufferGroup;
 
 /// How `initBufferGroup` registers the ring.
 // ast-grep-ignore: public-struct-field-default -- options bag: call sites set the one knob
 pub const BufferGroupOptions = struct {
-    /// Incremental consumption (`IOU_PBUF_RING_INC`): the kernel keeps a
-    /// buffer across completions, sets `F_BUF_MORE`, and writes at a further
-    /// offset. One buffer id carries a stream, not a message.
+    /// Incremental consumption (`IOU_PBUF_RING_INC`, kernel 6.12): the kernel
+    /// keeps a buffer across completions, sets `F_BUF_MORE`, and writes at a
+    /// further offset. One buffer id carries a stream, not a message. On an
+    /// older kernel the registration falls back to whole-buffer mode.
     ///
     /// `false` is whole-buffer mode: the kernel consumes one buffer per
     /// completion, the completion carries the id and its length, and `put`

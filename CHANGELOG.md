@@ -5,6 +5,10 @@ All notable changes to uring are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `initBufferGroup` registers a provided-buffer group with `.{ .incremental = false }`, where one completion consumes one whole buffer and `bufferPut` returns it, instead of `std`'s incremental registration where a buffer can carry several completions. `BufferGroupOptions` carries the choice, and `BufferGroup`, `BufferGroupOptions`, and `initBufferGroup` are exported from the module root.
+
 ## [0.4.0] - 2026-11-17
 
 ### Added

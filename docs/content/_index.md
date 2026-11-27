@@ -306,21 +306,32 @@ arriving into different buffers.
 The registration decides what a completion means, and the two modes are not
 interchangeable.
 
-- `BufferGroup.init`, `std`'s constructor, registers **incrementally**. The
-  kernel retains a buffer across completions, sets `IORING_CQE_F_BUF_MORE`,
-  and writes further bytes at a further offset. One buffer id carries a
-  stream, and a completion is a chunk. `bufferPut` advances the buffer's head;
-  the buffer returns to the ring only when the kernel is done with it.
+- `BufferGroup.init`, `std`'s constructor, **requests** incremental
+  consumption. The kernel retains a buffer across completions, sets
+  `IORING_CQE_F_BUF_MORE`, and writes further bytes at a further offset. One
+  buffer id carries a stream, and a completion is a chunk. `bufferPut`
+  advances the buffer's head; the buffer returns to the ring only when the
+  kernel is done with it. The request needs kernel 6.12; `std` retries without
+  the flag on an older kernel, which silently gives whole-buffer mode.
 - `uring.initBufferGroup(..., .{ .incremental = false })` registers
   **whole-buffer** mode. The kernel consumes one buffer per completion, the
   completion carries the id and the byte count, and `bufferPut` returns the
-  whole buffer to the ring. This is the mode for datagrams, PDUs, and anything
-  where one buffer id has to mean one message.
+  whole buffer to the ring.
 
-An incremental group used for messages fails in a way that is easy to misread:
-a second completion arrives for an id whose bytes you have not finished with,
-and there is no message boundary to find. `F_BUF_MORE` is how the completion
-tells you the kernel kept the buffer.
+Whole-buffer mode gives one message per completion only when two things hold.
+The socket must preserve message boundaries (`SOCK.DGRAM` or `SOCK.SEQPACKET`;
+on a stream, a PDU can still span completions and framing stays the caller's
+job), and `buffer_size` must be at least the largest message. A message longer
+than the buffer is truncated silently, and if the recv flags include
+`MSG_TRUNC` the completion's `res` is the real message length, which can exceed
+`buffer_size`; do not pass `MSG_TRUNC` unless you handle that.
+
+An incremental group used for messages fails in two ways that are easy to miss.
+A message longer than the buffer's remaining room is truncated silently, with
+no error. And `bufferGet` reads from the buffer's tracked head, which only
+`bufferPut` advances, so taking the next completion before returning the
+previous one returns the previous message's bytes. A whole-buffer completion
+may be held until `bufferPut`; an incremental one may not.
 
 ```zig
 // Incremental: a completion is a chunk of a stream.
@@ -345,6 +356,10 @@ const bytes = try loop.bufferGet(&message_group, cqe);
 try process(bytes);
 try loop.bufferPut(&message_group, cqe);
 ```
+
+A burst larger than `buffers_count` before the puts exhausts the ring: the
+multishot receive ends with `-ENOBUFS` and no `F_MORE`. Re-arm it, and do not
+call `bufferPut` on that completion, because it carries no `F_BUFFER`.
 
 `provideBuffers` and `removeBuffers` are the older, per-operation way, and
 exist for a kernel without the buffer ring.
