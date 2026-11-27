@@ -23,7 +23,7 @@ pub const ReadBuffer = linux.IoUring.ReadBuffer;
 
 const clock = @import("clock.zig");
 
-pub const Ring = @This();
+const Ring = @This();
 
 /// Ring setup, in place of the raw `io_uring_setup` flag word.
 ///

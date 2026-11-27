@@ -17,9 +17,6 @@ const linux = std.os.linux;
 const posix = std.posix;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-
-const clock = @import("clock.zig");
-
 /// The kernel's provided-buffer ring. `BufferGroup.init` takes the ring:
 /// `try uring.BufferGroup.init(&loop.ring.inner, allocator, group_id, size, count)`.
 ///
@@ -31,6 +28,9 @@ const clock = @import("clock.zig");
 /// gives whole-buffer mode. `initBufferGroup` registers either mode
 /// explicitly, and whole-buffer mode consumes one buffer per completion.
 pub const BufferGroup = linux.IoUring.BufferGroup;
+
+const clock = @import("clock.zig");
+const Ring = @import("Ring.zig");
 
 /// How `initBufferGroup` registers the ring.
 // ast-grep-ignore: public-struct-field-default -- options bag: call sites set the one knob
@@ -88,8 +88,6 @@ pub fn initBufferGroup(
         .buffers_count = buffers_count,
     };
 }
-const Ring = @import("Ring.zig").Ring;
-
 pub fn Loop(comptime Tag: type) type {
     if (@bitSizeOf(Tag) != 64) {
         @compileError("uring: Tag must be 64 bits, because user_data is one u64. " ++
